@@ -1,0 +1,5 @@
+# Core runtime (install PyTorch separately per README)
+nemo_toolkit[asr]
+pyaudio
+numpy<2.0
+pyperclip
