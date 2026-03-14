@@ -91,6 +91,7 @@ window.addEventListener("error", (event) => {
 
 let currentState: BridgeViewState | null = null;
 let visibleHistoryCount = 10;
+let historyClearedAfter: number | null = null;
 
 function formatTimestamp(timestamp: number | null): string {
   if (!timestamp) return "—";
@@ -211,7 +212,10 @@ function renderState(viewState: BridgeViewState) {
   hotkeyValue.innerHTML = renderHotkey(viewState.hotkey);
   bridgeUrl.textContent = viewState.bridgeUrl;
   bridgeCommand.textContent = viewState.bridgeStartCommand;
-  renderHistory(viewState.session.history || []);
+  const filteredHistory = (viewState.session.history || []).filter((item) => {
+    return historyClearedAfter === null || item.completed_at > historyClearedAfter;
+  });
+  renderHistory(filteredHistory);
 
   const lockedForBusyWork = viewState.connected && (viewState.session.model_loading || ["starting", "transcribing"].includes(viewState.session.state));
   if (viewState.session.model_loading) {
@@ -291,6 +295,7 @@ async function clearHistory() {
   if (!shouldClear) return;
   setBusy(true);
   try {
+    historyClearedAfter = Date.now() / 1000;
     const next = await electrobun.rpc!.request.clearHistory({});
     visibleHistoryCount = 10;
     renderState(next);
