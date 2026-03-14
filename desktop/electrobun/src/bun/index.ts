@@ -35,6 +35,7 @@ type DesktopRPC = {
       startRecording: { params: {}; response: BridgeViewState };
       stopRecording: { params: {}; response: BridgeViewState };
       toggleRecording: { params: {}; response: BridgeViewState };
+      clearHistory: { params: {}; response: BridgeViewState };
       showWindow: { params: {}; response: { success: true } };
     };
     messages: {};
@@ -130,6 +131,10 @@ const rpc = BrowserView.defineRPC<DesktopRPC>({
       },
       toggleRecording: async () => {
         await fetchBridgeJson("/session/toggle", { method: "POST", body: "{}" });
+        return await readBridgeState();
+      },
+      clearHistory: async () => {
+        await fetchBridgeJson("/session/clear-history", { method: "POST", body: "{}" });
         return await readBridgeState();
       },
       showWindow: async () => {

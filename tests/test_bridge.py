@@ -117,6 +117,10 @@ def test_bridge_reuses_loaded_model_across_sessions():
     assert second["model_loaded"] is True
     assert len(second["history"]) == 2
 
+    cleared = controller.clear_history()
+    assert cleared["history"] == []
+    assert cleared["last_transcript"] is None
+
     controller.shutdown()
 
 

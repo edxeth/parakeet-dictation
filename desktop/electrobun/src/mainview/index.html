@@ -34,6 +34,18 @@
         <p id="statusLine" class="status-line">Waiting for bridge status…</p>
       </section>
 
+      <section class="card transcript-card">
+        <div class="row spread middle">
+          <div class="label">Transcription history</div>
+          <button id="clearHistoryButton" class="secondary">Clear history</button>
+        </div>
+        <div id="historyMeta" class="meta">No transcripts yet.</div>
+        <div id="historyList" class="history-list">
+          <div class="history-empty">No transcripts yet.</div>
+        </div>
+        <button id="showMoreButton" class="secondary history-more hidden">Show 10 more</button>
+      </section>
+
       <details class="card collapsible-card" id="bridgeSection">
         <summary class="collapsible-summary">
           <span class="label">Bridge connection</span>
@@ -44,18 +56,6 @@
         <div class="label top-gap">Run this in WSL</div>
         <pre id="bridgeCommand" class="command">—</pre>
       </details>
-
-      <section class="card transcript-card">
-        <div class="row spread middle">
-          <div class="label">Transcription history</div>
-          <button id="refreshButton" class="secondary">Refresh</button>
-        </div>
-        <div id="historyMeta" class="meta">No transcripts yet.</div>
-        <div id="historyList" class="history-list">
-          <div class="history-empty">No transcripts yet.</div>
-        </div>
-        <button id="showMoreButton" class="secondary history-more hidden">Show 10 more</button>
-      </section>
 
       <details class="card collapsible-card debug-card" id="diagnosticsSection">
         <summary class="collapsible-summary">

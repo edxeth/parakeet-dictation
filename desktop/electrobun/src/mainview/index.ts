@@ -43,6 +43,7 @@ type DesktopRPC = {
       startRecording: { params: {}; response: BridgeViewState };
       stopRecording: { params: {}; response: BridgeViewState };
       toggleRecording: { params: {}; response: BridgeViewState };
+      clearHistory: { params: {}; response: BridgeViewState };
       showWindow: { params: {}; response: { success: true } };
     };
     messages: {};
@@ -77,7 +78,7 @@ const historyMeta = document.getElementById("historyMeta") as HTMLDivElement;
 const historyList = document.getElementById("historyList") as HTMLDivElement;
 const showMoreButton = document.getElementById("showMoreButton") as HTMLButtonElement;
 const errorBox = document.getElementById("errorBox") as HTMLPreElement;
-const refreshButton = document.getElementById("refreshButton") as HTMLButtonElement;
+const clearHistoryButton = document.getElementById("clearHistoryButton") as HTMLButtonElement;
 
 window.addEventListener("error", (event) => {
   errorBox.textContent = event.message || "unknown renderer error";
@@ -110,7 +111,7 @@ function renderHotkey(accelerator: string): string {
 
 function setBusy(busy: boolean) {
   toggleButton.disabled = busy;
-  refreshButton.disabled = busy;
+  clearHistoryButton.disabled = busy;
 }
 
 function setOverlay(visible: boolean, title = "Working…", message = "Please wait.") {
@@ -192,7 +193,7 @@ function renderState(viewState: BridgeViewState) {
     setOverlay(false);
   }
   toggleButton.disabled = !viewState.connected || viewState.session.model_loading || viewState.session.state === "transcribing";
-  refreshButton.disabled = false;
+  clearHistoryButton.disabled = !viewState.session.history.length || lockedForBusyWork;
 
   if (!viewState.connected) {
     toggleButton.textContent = "Bridge offline";
@@ -251,11 +252,26 @@ async function toggleRecording() {
   }
 }
 
+async function clearHistory() {
+  const shouldClear = window.confirm("Clear all transcription history for this bridge session?");
+  if (!shouldClear) return;
+  setBusy(true);
+  try {
+    const next = await electrobun.rpc!.request.clearHistory({});
+    visibleHistoryCount = 10;
+    renderState(next);
+  } catch (error) {
+    errorBox.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
 toggleButton.addEventListener("click", () => {
   void toggleRecording();
 });
-refreshButton.addEventListener("click", () => {
-  void refreshState();
+clearHistoryButton.addEventListener("click", () => {
+  void clearHistory();
 });
 showMoreButton.addEventListener("click", () => {
   visibleHistoryCount += 10;

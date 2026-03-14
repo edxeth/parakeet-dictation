@@ -357,6 +357,13 @@ class DictationBridgeController:
             raise BridgeStateError("Session is still transcribing")
         return self.start_session()
 
+    def clear_history(self) -> dict[str, Any]:
+        with self._lock:
+            self._history.clear()
+            self._last_transcript = None
+            self._last_completed_at = None
+            return self.get_session_payload()
+
     def health_payload(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -435,6 +442,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/session/toggle":
                 self._write_json(200, self.controller.toggle_session())
+                return
+            if parsed.path == "/session/clear-history":
+                self._write_json(200, self.controller.clear_history())
                 return
         except BridgeStateError as exc:
             self._write_json(409, {"error": "invalid_state", "detail": str(exc)})
