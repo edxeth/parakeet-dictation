@@ -17,6 +17,19 @@ import time
 import warnings
 import wave
 from contextlib import nullcontext
+from typing import Any
+
+from parakeet.errors import (
+    AUDIO_BACKEND_UNREACHABLE,
+    CLIPBOARD_UNAVAILABLE,
+    MODEL_IMPORT_FAILED,
+    MODEL_TRANSCRIBE_FAILED,
+    AppError,
+    AudioError,
+    ExitCode,
+    ModelError,
+)
+from parakeet.types import AudioDevice, DictationConfig, TranscriptionEngine, TranscriptionResult
 
 
 _shutdown_event = threading.Event()
@@ -90,21 +103,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def configure_logging(debug: bool, log_file: str) -> None:
-    if debug:
-        if log_file != "-":
+def configure_logging(config: DictationConfig) -> None:
+    if config.debug:
+        if config.log_file != "-":
             try:
-                if os.path.exists(log_file):
-                    os.remove(log_file)
+                if os.path.exists(config.log_file):
+                    os.remove(config.log_file)
             except Exception:
                 pass
             logging.basicConfig(
-                filename=log_file,
+                filename=config.log_file,
                 filemode="w",
                 level=logging.DEBUG,
                 force=True,
             )
-            print(f"Debug logs -> {log_file}")
+            print(f"Debug logs -> {config.log_file}")
         else:
             logging.basicConfig(level=logging.DEBUG, force=True)
     else:
@@ -228,26 +241,49 @@ def _load_runtime_dependencies(debug: bool):
     return nemo_asr, pyaudio, pyperclip, torch
 
 
-def list_devices(pyaudio_module) -> int:
+def _collect_input_devices(pyaudio_module: Any) -> list[AudioDevice]:
+    pa = pyaudio_module.PyAudio()
     try:
-        pa = pyaudio_module.PyAudio()
-        count = pa.get_device_count()
-        print("Input devices:")
-        for idx in range(count):
+        devices: list[AudioDevice] = []
+        for idx in range(pa.get_device_count()):
             info = pa.get_device_info_by_index(idx)
-            if int(info.get("maxInputChannels", 0)) > 0:
-                name = info.get("name", "unknown")
-                rate = int(info.get("defaultSampleRate", 0))
-                print(f"- id={idx} name='{name}' rate={rate}Hz")
+            if int(info.get("maxInputChannels", 0)) <= 0:
+                continue
+            devices.append(
+                AudioDevice(
+                    id=idx,
+                    name=str(info.get("name", "unknown")),
+                    default_sample_rate=int(info.get("defaultSampleRate", 0)),
+                    max_input_channels=int(info.get("maxInputChannels", 0)),
+                    host_api="unknown",
+                )
+            )
+        return devices
+    finally:
         pa.terminate()
-        return 0
+
+
+def list_devices(pyaudio_module: Any) -> int:
+    try:
+        devices = _collect_input_devices(pyaudio_module)
+        print("Input devices:")
+        for device in devices:
+            print(
+                f"- id={device.id} name='{device.name}' rate={device.default_sample_rate}Hz"
+            )
+        return int(ExitCode.OK)
     except Exception as exc:
-        print(f"Error listing devices: {exc}")
-        return 1
+        error = AudioError(AUDIO_BACKEND_UNREACHABLE, str(exc))
+        print(f"Error listing devices: {error}")
+        return int(ExitCode.ERROR)
 
 
-def record_audio_interruptible(args: argparse.Namespace, pyaudio_module, sample_rate: int = 16000):
-    ctx = SilentSTDERR() if not args.debug else nullcontext()
+def record_audio_interruptible(
+    config: DictationConfig,
+    pyaudio_module: Any,
+    sample_rate: int = 16000,
+) -> bytes | None:
+    ctx = SilentSTDERR() if not config.debug else nullcontext()
     with ctx:
         pa = pyaudio_module.PyAudio()
         try:
@@ -256,11 +292,12 @@ def record_audio_interruptible(args: argparse.Namespace, pyaudio_module, sample_
                 channels=1,
                 rate=sample_rate,
                 input=True,
-                input_device_index=args.input_device,
+                input_device_index=config.input_device if isinstance(config.input_device, int) else None,
                 frames_per_buffer=1024,
             )
         except Exception as exc:
-            print(f"❌ Audio error: {exc}")
+            error = AudioError(AUDIO_BACKEND_UNREACHABLE, str(exc))
+            print(f"❌ Audio error: {error}")
             try:
                 pa.terminate()
             except Exception:
@@ -270,7 +307,7 @@ def record_audio_interruptible(args: argparse.Namespace, pyaudio_module, sample_
     frames: list[bytes] = []
     print("🎤 Recording...", flush=True)
 
-    ctx = SilentSTDERR() if not args.debug else nullcontext()
+    ctx = SilentSTDERR() if not config.debug else nullcontext()
     with ctx:
         while not _shutdown_event.is_set():
             readable, _, _ = select.select([sys.stdin], [], [], 0.01)
@@ -290,7 +327,7 @@ def record_audio_interruptible(args: argparse.Namespace, pyaudio_module, sample_
     return b"".join(frames) if frames else None
 
 
-def _load_model(args: argparse.Namespace, nemo_asr, torch_module):
+def _load_model(config: DictationConfig, nemo_asr: Any, torch_module: Any) -> tuple[TranscriptionEngine, bool, float, float]:
     stop_spinner = threading.Event()
     spinner_thread = threading.Thread(
         target=spinner_animation,
@@ -300,26 +337,31 @@ def _load_model(args: argparse.Namespace, nemo_asr, torch_module):
     )
     spinner_thread.start()
 
-    load_ctx = nullcontext() if args.debug else _silence_context()
+    load_ctx = nullcontext() if config.debug else _silence_context()
     start = time.perf_counter()
     try:
         with load_ctx:
             model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v3")
-    except Exception:
-        raise
+    except Exception as exc:
+        raise ModelError(MODEL_IMPORT_FAILED, str(exc)) from exc
     finally:
         end = time.perf_counter()
         stop_spinner.set()
         spinner_thread.join()
 
-    use_cuda = torch_module.cuda.is_available() and not args.cpu
+    use_cuda = torch_module.cuda.is_available() and not config.cpu
     device = "cuda" if use_cuda else "cpu"
     model.to(device)
     model.eval()
     return model, use_cuda, start, end
 
 
-def _transcribe_once(args: argparse.Namespace, model, audio_data: bytes, sample_rate: int, debug: bool):
+def _transcribe_once(
+    config: DictationConfig,
+    model: TranscriptionEngine,
+    audio_data: bytes,
+    sample_rate: int,
+) -> tuple[TranscriptionResult, str, float, float]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         save_audio(audio_data, tmp.name, sample_rate=sample_rate)
         temp_path = tmp.name
@@ -333,44 +375,48 @@ def _transcribe_once(args: argparse.Namespace, model, audio_data: bytes, sample_
     )
     spinner_thread.start()
 
-    infer_ctx = nullcontext() if debug else _silence_context()
+    infer_ctx = nullcontext() if config.debug else _silence_context()
     start = time.perf_counter()
     try:
         with infer_ctx:
             result = model.transcribe([temp_path], verbose=False)
         if isinstance(result, list) and result:
             first = result[0]
-            transcript = getattr(first, "text", first if isinstance(first, str) else str(first))
+            transcript_text = getattr(first, "text", first if isinstance(first, str) else str(first))
         else:
-            transcript = str(result)
-        return transcript, temp_path, start, time.perf_counter()
+            transcript_text = str(result)
+        transcription = TranscriptionResult(text=transcript_text)
+        return transcription, temp_path, start, time.perf_counter()
+    except Exception as exc:
+        raise ModelError(MODEL_TRANSCRIBE_FAILED, str(exc)) from exc
     finally:
         stop_spinner.set()
         spinner_thread.join()
 
 
 def run_dictation(args: argparse.Namespace) -> int:
-    configure_logging(args.debug, args.log_file)
+    config = DictationConfig.from_namespace(args)
+    configure_logging(config)
     print("Starting...", flush=True)
 
     nemo_asr, pyaudio_module, pyperclip_module, torch_module = _load_runtime_dependencies(
-        args.debug
+        config.debug
     )
 
-    if args.list_devices:
+    if config.list_devices:
         return list_devices(pyaudio_module)
 
-    if args.debug and args.log_file != "-":
+    if config.debug and config.log_file != "-":
         redirect_library_loggers_to_root_file()
 
     try:
-        model, use_cuda, load_start, load_end = _load_model(args, nemo_asr, torch_module)
-    except Exception as exc:
+        model, use_cuda, load_start, load_end = _load_model(config, nemo_asr, torch_module)
+    except ModelError as exc:
         print(f"❌ Error: {exc}")
-        return 1
+        return int(ExitCode.ERROR)
 
     if _shutdown_event.is_set():
-        return 0
+        return int(ExitCode.OK)
 
     print("🚀 PARAKEET TDT 0.6B V3")
     if torch_module.cuda.is_available():
@@ -380,7 +426,7 @@ def run_dictation(args: argparse.Namespace) -> int:
     print("   Ctrl+C to exit")
     print("=" * 60 + "\n")
 
-    if args.debug:
+    if config.debug:
         print(f"Model device: {next(model.parameters()).device}")
         if use_cuda:
             capability = torch_module.cuda.get_device_capability()
@@ -399,17 +445,17 @@ def run_dictation(args: argparse.Namespace) -> int:
 
             sample_rate = 16000
             record_start = time.perf_counter()
-            audio_data = record_audio_interruptible(args, pyaudio_module, sample_rate=sample_rate)
+            audio_data = record_audio_interruptible(config, pyaudio_module, sample_rate=sample_rate)
             record_end = time.perf_counter()
 
             if not audio_data or _shutdown_event.is_set():
                 break
 
             try:
-                transcript, temp_path, infer_start, infer_end = _transcribe_once(
-                    args, model, audio_data, sample_rate, args.debug
+                transcription, temp_path, infer_start, infer_end = _transcribe_once(
+                    config, model, audio_data, sample_rate
                 )
-            except Exception as exc:
+            except ModelError as exc:
                 print(f"❌ Error: {exc}")
                 next_wait_shows_prompt = True
                 continue
@@ -421,16 +467,17 @@ def run_dictation(args: argparse.Namespace) -> int:
                     pass
                 break
 
-            print(f"📝 {transcript}\n")
+            print(f"📝 {transcription.text}\n")
 
-            if not args.no_clipboard:
+            if config.clipboard:
                 try:
-                    pyperclip_module.copy(transcript)
+                    pyperclip_module.copy(transcription.text)
                 except Exception as exc:
-                    if args.debug:
-                        print(f"Clipboard warning: {exc}")
+                    warning = AppError(CLIPBOARD_UNAVAILABLE, str(exc))
+                    if config.debug:
+                        print(f"Clipboard warning: {warning}")
 
-            if args.debug:
+            if config.debug:
                 seconds = len(audio_data) / (2 * sample_rate)
                 print(
                     f"Audio length: {seconds:.2f}s | Record: {record_end - record_start:.3f}s | Infer: {infer_end - infer_start:.3f}s"
@@ -447,9 +494,9 @@ def run_dictation(args: argparse.Namespace) -> int:
 
             next_wait_shows_prompt = True
 
-        return 0
+        return int(ExitCode.OK)
     except KeyboardInterrupt:
-        return 0
+        return int(ExitCode.OK)
 
 
 def main(argv: list[str] | None = None) -> int:

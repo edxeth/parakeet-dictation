@@ -20,7 +20,7 @@
         "Update the CLI-facing code to import and use those shared types or error codes instead of ad hoc inline structures",
         "Run automated checks and confirm the shared contracts load cleanly without breaking the packaged CLI"
       ],
-      "passes": false,
+      "passes": true,
       "regression_notes": ""
     },
     {
