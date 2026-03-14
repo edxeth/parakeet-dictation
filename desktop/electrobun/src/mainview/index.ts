@@ -1,18 +1,28 @@
 import Electrobun, { Electroview } from "electrobun/view";
 
+type TranscriptPayload = {
+  schema_version: number;
+  transcript: string;
+  normalized_transcript?: string;
+  device?: string;
+  metadata?: Record<string, unknown>;
+};
+
+type TranscriptHistoryItem = {
+  id: string;
+  completed_at: number;
+  payload: TranscriptPayload;
+};
+
 type SessionPayload = {
   schema_version: number;
   state: "stopped" | "idle" | "starting" | "recording" | "transcribing" | "error";
   started_at: number | null;
   last_completed_at: number | null;
-  last_transcript: {
-    schema_version: number;
-    transcript: string;
-    normalized_transcript?: string;
-    device?: string;
-    metadata?: Record<string, unknown>;
-  } | null;
+  last_transcript: TranscriptPayload | null;
   last_error: string | null;
+  model_loaded: boolean;
+  history: TranscriptHistoryItem[];
   config: Record<string, unknown>;
   stderr_tail: string[];
 };
@@ -72,10 +82,12 @@ const toggleButton = document.getElementById("toggleButton") as HTMLButtonElemen
 const statusLine = document.getElementById("statusLine") as HTMLParagraphElement;
 const bridgeUrl = document.getElementById("bridgeUrl") as HTMLDivElement;
 const bridgeCommand = document.getElementById("bridgeCommand") as HTMLPreElement;
-const transcriptMeta = document.getElementById("transcriptMeta") as HTMLDivElement;
-const transcriptText = document.getElementById("transcriptText") as HTMLPreElement;
+const historyMeta = document.getElementById("historyMeta") as HTMLDivElement;
+const historyList = document.getElementById("historyList") as HTMLDivElement;
 const errorBox = document.getElementById("errorBox") as HTMLPreElement;
 const refreshButton = document.getElementById("refreshButton") as HTMLButtonElement;
+
+let currentState: BridgeViewState | null = null;
 
 function formatTimestamp(timestamp: number | null): string {
   if (!timestamp) return "—";
@@ -87,7 +99,52 @@ function setBusy(busy: boolean) {
   refreshButton.disabled = busy;
 }
 
+async function copyTranscript(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (error) {
+    errorBox.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
+function renderHistory(items: TranscriptHistoryItem[]) {
+  if (!items.length) {
+    historyMeta.textContent = "No transcripts yet.";
+    historyList.innerHTML = `<div class="history-empty">No transcripts yet.</div>`;
+    return;
+  }
+
+  historyMeta.textContent = `${items.length} transcript${items.length === 1 ? "" : "s"}`;
+  historyList.innerHTML = items
+    .slice()
+    .reverse()
+    .map((item) => {
+      const payload = item.payload;
+      const cancelled = Boolean(payload.metadata?.cancelled_before_recording);
+      const body = payload.transcript || (cancelled ? "Cancelled before recording started." : "");
+      return `
+        <div class="history-item">
+          <div class="history-header">
+            <div class="history-time">${formatTimestamp(item.completed_at)}${payload.device ? ` • ${payload.device}` : ""}</div>
+            <div class="history-actions">
+              <button class="history-copy" data-copy="${encodeURIComponent(payload.transcript || "")}">Copy</button>
+            </div>
+          </div>
+          <div class="history-body">${body || "<empty transcript>"}</div>
+        </div>
+      `;
+    })
+    .join("");
+
+  historyList.querySelectorAll<HTMLButtonElement>(".history-copy").forEach((button) => {
+    button.addEventListener("click", () => {
+      void copyTranscript(decodeURIComponent(button.dataset.copy || ""));
+    });
+  });
+}
+
 function renderState(viewState: BridgeViewState) {
+  currentState = viewState;
   const sessionState = viewState.connected ? viewState.session.state : "offline";
   statusBadge.textContent = viewState.connected ? viewState.session.state : "Disconnected";
   statusBadge.className = `badge ${sessionState}`;
@@ -95,31 +152,16 @@ function renderState(viewState: BridgeViewState) {
   hotkeyValue.textContent = viewState.hotkey;
   bridgeUrl.textContent = viewState.bridgeUrl;
   bridgeCommand.textContent = viewState.bridgeStartCommand;
-
-  const transcript = viewState.session.last_transcript;
-  const cancelledBeforeRecording = Boolean(transcript?.metadata?.cancelled_before_recording);
-  if (transcript) {
-    transcriptText.textContent = transcript.transcript || (cancelledBeforeRecording ? "Cancelled before recording started." : "");
-    transcriptText.classList.toggle("empty", !transcriptText.textContent);
-    transcriptMeta.textContent = [
-      cancelledBeforeRecording ? "cancelled before recording started" : null,
-      transcript.device ? `device: ${transcript.device}` : null,
-      `completed: ${formatTimestamp(viewState.session.last_completed_at)}`,
-    ]
-      .filter(Boolean)
-      .join(" • ");
-  } else {
-    transcriptText.textContent = "No transcript yet.";
-    transcriptText.classList.add("empty");
-    transcriptMeta.textContent = "No transcript yet.";
-  }
+  renderHistory(viewState.session.history || []);
 
   if (!viewState.connected) {
     toggleButton.textContent = "Bridge offline";
     statusLine.textContent = "Start the WSL bridge command below, then use the button or hotkey.";
   } else if (viewState.session.state === "starting") {
     toggleButton.textContent = "Cancel loading";
-    statusLine.textContent = "Loading model. Wait for recording to start before speaking, or click again to cancel.";
+    statusLine.textContent = viewState.session.model_loaded
+      ? "Preparing to record…"
+      : "Loading model. Wait until recording starts before speaking, or click again to cancel.";
   } else if (viewState.session.state === "recording") {
     toggleButton.textContent = "Stop recording";
     statusLine.textContent = `Recording in progress since ${formatTimestamp(viewState.session.started_at)}.`;
@@ -130,8 +172,10 @@ function renderState(viewState: BridgeViewState) {
     toggleButton.textContent = "Try again";
     statusLine.textContent = "Bridge reachable but the backend reported an error.";
   } else {
-    toggleButton.textContent = "Start recording";
-    statusLine.textContent = "Ready. Press the button or the global hotkey to begin.";
+    toggleButton.textContent = viewState.session.model_loaded ? "Start recording" : "Load + record";
+    statusLine.textContent = viewState.session.model_loaded
+      ? "Model ready. Press the button or the hotkey to begin."
+      : "Ready. First recording will load the model; after that it stays warm.";
   }
 
   const errorLines = [];
@@ -170,6 +214,13 @@ toggleButton.addEventListener("click", () => {
 });
 refreshButton.addEventListener("click", () => {
   void refreshState();
+});
+window.addEventListener("keydown", (event) => {
+  const pressedR = event.key.toLowerCase() === "r";
+  if (pressedR && event.ctrlKey && event.altKey) {
+    event.preventDefault();
+    void toggleRecording();
+  }
 });
 
 (electrobun.rpc as any)?.addMessageListener("bridgeStateUpdated", (state: BridgeViewState) => {

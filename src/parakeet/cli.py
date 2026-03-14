@@ -148,8 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bridge_parser.add_argument(
         "--clipboard",
-        action="store_true",
-        help="Enable clipboard copy for bridge-controlled sessions.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable clipboard copy for bridge-controlled sessions.",
     )
     bridge_parser.add_argument(
         "--debug",

@@ -5,17 +5,23 @@ from __future__ import annotations
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import os
 import signal
-import subprocess
-import sys
 import threading
 import time
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from parakeet.audio import list_input_devices
+from parakeet.dictation import (
+    _load_model,
+    _load_runtime_dependencies,
+    _transcribe_once,
+    record_audio_interruptible,
+)
 from parakeet.doctor import collect_doctor_report
+from parakeet.errors import ExitCode, ModelError
+from parakeet.output import copy_transcript_to_clipboard, render_transcription
+from parakeet.types import DictationConfig, TranscriptionResult
 
 
 BRIDGE_SCHEMA_VERSION = 1
@@ -25,11 +31,32 @@ class BridgeStateError(RuntimeError):
     """Raised when a bridge request is invalid for the current session state."""
 
 
+class _DiagnosticStream:
+    def __init__(self, controller: "DictationBridgeController") -> None:
+        self._controller = controller
+
+    def write(self, text: str) -> int:
+        normalized = text.replace("\x1b[2K", "").replace("\r", "\n")
+        if "Loading model" in normalized:
+            self._controller._append_diagnostic("⏳ Loading model")
+            return len(text)
+        if "Generating" in normalized:
+            self._controller._append_diagnostic("🤖 Generating...")
+            return len(text)
+        for line in normalized.splitlines():
+            stripped = line.strip()
+            if stripped:
+                self._controller._append_diagnostic(stripped)
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
 class DictationBridgeController:
     def __init__(
         self,
         *,
-        python_executable: str = sys.executable,
         cpu: bool = False,
         input_device: int | str | None = None,
         vad: bool = False,
@@ -38,12 +65,14 @@ class DictationBridgeController:
         vad_mode: int = 2,
         debug: bool = False,
         log_file: str = "transcriber.debug.log",
-        clipboard: bool = False,
-        popen_factory: Callable[..., Any] = subprocess.Popen,
+        clipboard: bool = True,
         transcript_timeout: float = 300.0,
         stderr_tail_limit: int = 200,
+        runtime_loader: Callable[[bool], tuple[Any, Any, Any, Any]] = _load_runtime_dependencies,
+        model_loader: Callable[..., tuple[Any, bool, float, float]] = _load_model,
+        recorder: Callable[..., bytes | None] = record_audio_interruptible,
+        transcriber: Callable[..., tuple[TranscriptionResult, str, float, float]] = _transcribe_once,
     ) -> None:
-        self.python_executable = python_executable
         self.cpu = cpu
         self.input_device = input_device
         self.vad = vad
@@ -53,225 +82,239 @@ class DictationBridgeController:
         self.debug = debug
         self.log_file = log_file
         self.clipboard = clipboard
-        self._popen_factory = popen_factory
         self._transcript_timeout = transcript_timeout
         self._stderr_tail_limit = stderr_tail_limit
+        self._runtime_loader = runtime_loader
+        self._model_loader = model_loader
+        self._recorder = recorder
+        self._transcriber = transcriber
 
         self._lock = threading.RLock()
-        self._result_ready = threading.Condition(self._lock)
-        self._process: Any | None = None
-        self._stdout_thread: threading.Thread | None = None
-        self._stderr_thread: threading.Thread | None = None
+        self._runtime_ready = threading.Event()
+        self._session_finished = threading.Event()
+        self._stop_requested = threading.Event()
+        self._shutdown_requested = threading.Event()
+        self._session_thread: threading.Thread | None = None
         self._state = "stopped"
         self._started_at: float | None = None
         self._last_completed_at: float | None = None
         self._last_transcript: dict[str, Any] | None = None
         self._last_error: str | None = None
         self._stderr_tail: list[str] = []
-        self._transcript_counter = 0
-        self._capture_started = False
+        self._history: list[dict[str, Any]] = []
 
-    def _build_command(self) -> list[str]:
-        command = [
-            self.python_executable,
-            "-u",
-            "-m",
-            "parakeet.cli",
-            "dictation",
-            "--format",
-            "json",
-            "--bridge-mode",
-        ]
-        if self.cpu:
-            command.append("--cpu")
-        if self.input_device is not None:
-            command.extend(["--input-device", str(self.input_device)])
-        if self.vad:
-            command.append("--vad")
-        if self.max_silence_ms != 1200:
-            command.extend(["--max-silence-ms", str(self.max_silence_ms)])
-        if self.min_speech_ms != 300:
-            command.extend(["--min-speech-ms", str(self.min_speech_ms)])
-        if self.vad_mode != 2:
-            command.extend(["--vad-mode", str(self.vad_mode)])
-        if self.debug:
-            command.append("--debug")
-            if self.log_file:
-                command.extend(["--log-file", self.log_file])
-        if self.clipboard:
-            command.append("--clipboard")
-        else:
-            command.append("--no-clipboard")
-        return command
+        self._nemo_asr: Any | None = None
+        self._pyaudio_module: Any | None = None
+        self._pyperclip_module: Any | None = None
+        self._torch_module: Any | None = None
+        self._model: Any | None = None
+        self._model_loaded = False
+        self._diagnostic_stream = _DiagnosticStream(self)
 
-    def _spawn_process(self) -> Any:
-        return self._popen_factory(
-            self._build_command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+    def _append_diagnostic(self, text: str) -> None:
+        with self._lock:
+            if not text:
+                return
+            if self._stderr_tail and self._stderr_tail[-1] == text:
+                return
+            self._stderr_tail.append(text)
+            if len(self._stderr_tail) > self._stderr_tail_limit:
+                self._stderr_tail = self._stderr_tail[-self._stderr_tail_limit :]
+            if text == "🎤 Recording..." and self._state == "starting":
+                self._state = "recording"
+
+    def _config(self) -> DictationConfig:
+        return DictationConfig(
+            cpu=self.cpu,
+            input_device=self.input_device,
+            vad=self.vad,
+            max_silence_ms=self.max_silence_ms,
+            min_speech_ms=self.min_speech_ms,
+            vad_mode=self.vad_mode,
+            format="json",
+            output_file=None,
+            clipboard=self.clipboard,
+            debug=self.debug,
+            log_file=self.log_file,
+            list_devices=False,
         )
 
-    def ensure_running(self) -> None:
-        with self._lock:
-            if self._process is not None and self._process.poll() is None:
-                return
+    def _ensure_runtime_loaded(self) -> None:
+        if self._runtime_ready.is_set():
+            return
+        self._append_diagnostic("Starting...")
+        nemo_asr, pyaudio_module, pyperclip_module, torch_module = self._runtime_loader(self.debug)
+        self._nemo_asr = nemo_asr
+        self._pyaudio_module = pyaudio_module
+        self._pyperclip_module = pyperclip_module
+        self._torch_module = torch_module
+        self._runtime_ready.set()
 
-            self._process = self._spawn_process()
-            self._state = "idle"
+    def _ensure_model_loaded(self, config: DictationConfig) -> None:
+        if self._model_loaded:
+            return
+        if self._nemo_asr is None or self._torch_module is None:
+            raise RuntimeError("Bridge runtime dependencies are not loaded")
+        model, _use_cuda, _load_start, _load_end = self._model_loader(
+            config,
+            self._nemo_asr,
+            self._torch_module,
+            status_stream=self._diagnostic_stream,
+        )
+        self._model = model
+        self._model_loaded = True
+
+    def _complete_session(self, transcription: TranscriptionResult) -> None:
+        payload = json.loads(render_transcription(transcription, "json"))
+        completed_at = time.time()
+        history_item = {
+            "id": f"tx-{int(completed_at * 1000)}",
+            "completed_at": completed_at,
+            "payload": payload,
+        }
+        with self._lock:
+            self._last_transcript = payload
+            self._last_completed_at = completed_at
             self._last_error = None
-            self._stderr_tail = []
-            self._capture_started = False
-            self._stdout_thread = threading.Thread(target=self._stdout_reader, daemon=True)
-            self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
-            self._stdout_thread.start()
-            self._stderr_thread.start()
+            self._state = "idle"
+            self._started_at = None
+            self._history.append(history_item)
 
-    def shutdown(self) -> None:
-        process = None
+    def _complete_cancelled_before_recording(self) -> None:
         with self._lock:
-            process = self._process
-            self._process = None
-            self._state = "stopped"
-        if process is None:
-            return
-        try:
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-    def _stdout_reader(self) -> None:
-        process = self._process
-        if process is None or process.stdout is None:
-            return
-
-        while True:
-            line = process.stdout.readline()
-            if line == "":
-                break
-            payload_text = line.strip()
-            if not payload_text:
-                continue
-            try:
-                payload = json.loads(payload_text)
-            except json.JSONDecodeError:
-                with self._lock:
-                    self._last_error = f"Unexpected stdout from dictation subprocess: {payload_text}"
-                continue
-
-            with self._result_ready:
-                self._last_transcript = payload
-                self._last_completed_at = time.time()
+            if self._last_transcript and self._last_transcript.get("metadata", {}).get("cancelled_before_recording"):
                 self._state = "idle"
                 self._started_at = None
                 self._last_error = None
-                self._capture_started = False
-                self._transcript_counter += 1
-                self._result_ready.notify_all()
+                return
+        self._complete_session(
+            TranscriptionResult(
+                text="",
+                metadata={"cancelled_before_recording": True},
+            )
+        )
 
-        with self._result_ready:
-            if self._process is process and process.poll() not in {None, 0}:
-                stderr_preview = self.stderr_tail(limit=20)
-                self._last_error = (
-                    f"Dictation subprocess exited with code {process.poll()}"
-                    + (f": {stderr_preview}" if stderr_preview else "")
-                )
-                self._state = "error"
-                self._process = None
-                self._result_ready.notify_all()
-            elif self._process is process and process.poll() == 0:
-                self._process = None
-                self._result_ready.notify_all()
-
-    def _stderr_reader(self) -> None:
-        process = self._process
-        if process is None or process.stderr is None:
+    def _copy_to_clipboard(self, transcription: TranscriptionResult) -> None:
+        if not self.clipboard or self._pyperclip_module is None:
             return
+        warning = copy_transcript_to_clipboard(transcription, self._pyperclip_module)
+        if warning is not None:
+            self._append_diagnostic(f"Clipboard warning: {warning}")
 
-        while True:
-            line = process.stderr.readline()
-            if line == "":
-                break
-            text = line.rstrip("\n")
-            if not text:
-                continue
+    def _session_worker(self) -> None:
+        config = self._config()
+        temp_path: str | None = None
+        try:
+            self._ensure_runtime_loaded()
+            if self._stop_requested.is_set() or self._shutdown_requested.is_set():
+                self._complete_cancelled_before_recording()
+                return
+
+            self._ensure_model_loaded(config)
+            if self._stop_requested.is_set() or self._shutdown_requested.is_set():
+                self._complete_cancelled_before_recording()
+                return
+
             with self._lock:
-                self._stderr_tail.append(text)
-                if "🎤 Recording..." in text:
-                    self._capture_started = True
-                    self._state = "recording"
-                if len(self._stderr_tail) > self._stderr_tail_limit:
-                    self._stderr_tail = self._stderr_tail[-self._stderr_tail_limit :]
+                self._state = "recording"
 
-    def stderr_tail(self, *, limit: int = 50) -> str:
+            if self._pyaudio_module is None:
+                raise RuntimeError("PyAudio runtime is unavailable")
+
+            audio_data = self._recorder(
+                config,
+                self._pyaudio_module,
+                sample_rate=16000,
+                stop_requested=lambda: self._stop_requested.is_set() or self._shutdown_requested.is_set(),
+                status_stream=self._diagnostic_stream,
+            )
+
+            if self._shutdown_requested.is_set():
+                with self._lock:
+                    self._state = "stopped"
+                    self._started_at = None
+                return
+
+            if not audio_data:
+                self._complete_cancelled_before_recording()
+                return
+
+            with self._lock:
+                self._state = "transcribing"
+
+            if self._model is None:
+                raise RuntimeError("Model is not loaded")
+            transcription, temp_path, _infer_start, _infer_end = self._transcriber(
+                config,
+                self._model,
+                audio_data,
+                16000,
+                status_stream=self._diagnostic_stream,
+            )
+            self._copy_to_clipboard(transcription)
+            self._complete_session(transcription)
+        except ModelError as exc:
+            with self._lock:
+                self._last_error = str(exc)
+                self._state = "error"
+                self._started_at = None
+        except Exception as exc:  # pragma: no cover - defensive runtime guard
+            with self._lock:
+                self._last_error = str(exc)
+                self._state = "error"
+                self._started_at = None
+        finally:
+            if temp_path:
+                try:
+                    import os
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+            self._session_finished.set()
+
+    def shutdown(self) -> None:
+        self._shutdown_requested.set()
+        self._stop_requested.set()
+        thread = self._session_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
         with self._lock:
-            return "\n".join(self._stderr_tail[-limit:])
-
-    def _signal_stop(self) -> None:
-        process = self._process
-        if process is None or process.poll() is not None:
-            raise BridgeStateError("Dictation subprocess is not running")
-        if hasattr(signal, "SIGUSR1"):
-            os.kill(process.pid, signal.SIGUSR1)
-        else:  # pragma: no cover - non-Linux fallback
-            process.terminate()
+            self._state = "stopped"
+            self._started_at = None
 
     def start_session(self) -> dict[str, Any]:
         with self._lock:
             if self._state in {"starting", "recording", "transcribing"}:
                 raise BridgeStateError(f"Cannot start while session is {self._state}")
-            self.ensure_running()
+            if self._session_thread is not None and self._session_thread.is_alive():
+                raise BridgeStateError("Cannot start while the previous session is still winding down")
+            self._stop_requested.clear()
+            self._session_finished.clear()
             self._state = "starting"
             self._started_at = time.time()
             self._last_error = None
+            self._session_thread = threading.Thread(target=self._session_worker, daemon=True)
+            self._session_thread.start()
             return self.get_session_payload()
 
     def stop_session(self) -> dict[str, Any]:
-        with self._result_ready:
+        with self._lock:
             if self._state not in {"starting", "recording"}:
                 raise BridgeStateError(f"Cannot stop while session is {self._state}")
-
-            if not self._capture_started:
-                process = self._process
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except Exception:
-                        process.kill()
-                self._process = None
-                self._state = "idle"
-                self._started_at = None
-                self._last_completed_at = time.time()
-                self._last_error = None
-                self._capture_started = False
-                self._last_transcript = {
-                    "schema_version": 1,
-                    "transcript": "",
-                    "metadata": {"cancelled_before_recording": True},
-                }
+            current_state = self._state
+            self._stop_requested.set()
+            if current_state == "starting" and not self._model_loaded:
+                self._complete_cancelled_before_recording()
                 return self.get_session_payload()
-
-            counter_before = self._transcript_counter
-            self._signal_stop()
-            self._state = "transcribing"
-            deadline = time.time() + self._transcript_timeout
-            while self._transcript_counter == counter_before:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    self._last_error = "Timed out waiting for transcription result"
-                    self._state = "error"
-                    raise TimeoutError(self._last_error)
-                self._result_ready.wait(timeout=remaining)
-            return self.get_session_payload()
+        thread = self._session_thread
+        if thread is not None:
+            thread.join(timeout=min(self._transcript_timeout, 10.0))
+        if not self._session_finished.is_set():
+            with self._lock:
+                self._state = "error"
+                self._last_error = "Timed out waiting for session to stop"
+            raise TimeoutError(self._last_error)
+        return self.get_session_payload()
 
     def toggle_session(self) -> dict[str, Any]:
         with self._lock:
@@ -289,8 +332,7 @@ class DictationBridgeController:
                 "ok": True,
                 "bridge": {
                     "backend": "parakeet-dictation-bridge",
-                    "python": self.python_executable,
-                    "dictation_pid": None if self._process is None else self._process.pid,
+                    "model_loaded": self._model_loaded,
                 },
                 "session": self.get_session_payload(),
             }
@@ -304,6 +346,8 @@ class DictationBridgeController:
                 "last_completed_at": self._last_completed_at,
                 "last_transcript": self._last_transcript,
                 "last_error": self._last_error,
+                "model_loaded": self._model_loaded,
+                "history": list(self._history),
                 "config": {
                     "cpu": self.cpu,
                     "input_device": self.input_device,
@@ -408,7 +452,7 @@ def build_bridge_controller_from_namespace(namespace: Any) -> DictationBridgeCon
         vad_mode=int(getattr(namespace, "vad_mode", 2)),
         debug=bool(getattr(namespace, "debug", False)),
         log_file=str(getattr(namespace, "log_file", "transcriber.debug.log")),
-        clipboard=bool(getattr(namespace, "clipboard", False)),
+        clipboard=bool(getattr(namespace, "clipboard", True)),
     )
 
 

@@ -337,8 +337,9 @@ def record_audio_interruptible(
     sample_rate: int = 16000,
     *,
     stop_requested: Callable[[], bool] | None = None,
+    status_stream=None,
 ) -> bytes | None:
-    status_stream = _status_stream(config)
+    status_stream = status_stream or _status_stream(config)
     frames_per_buffer = VAD_FRAME_SAMPLES if config.vad else 1024
     ctx = SilentSTDERR() if not config.debug else nullcontext()
     with ctx:
@@ -406,12 +407,18 @@ def record_audio_interruptible(
     return audio_data or None
 
 
-def _load_model(config: DictationConfig, nemo_asr: Any, torch_module: Any) -> tuple[TranscriptionEngine, bool, float, float]:
+def _load_model(
+    config: DictationConfig,
+    nemo_asr: Any,
+    torch_module: Any,
+    *,
+    status_stream=None,
+) -> tuple[TranscriptionEngine, bool, float, float]:
     stop_spinner = threading.Event()
     spinner_thread = threading.Thread(
         target=spinner_animation,
         args=(stop_spinner, "⏳ Loading model"),
-        kwargs={"stream": _status_stream(config)},
+        kwargs={"stream": status_stream or _status_stream(config)},
         daemon=True,
     )
     spinner_thread.start()
@@ -440,6 +447,8 @@ def _transcribe_once(
     model: TranscriptionEngine,
     audio_data: bytes,
     sample_rate: int,
+    *,
+    status_stream=None,
 ) -> tuple[TranscriptionResult, str, float, float]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         save_audio(audio_data, tmp.name, sample_rate=sample_rate)
@@ -449,7 +458,7 @@ def _transcribe_once(
     spinner_thread = threading.Thread(
         target=spinner_animation,
         args=(stop_spinner, "🤖 Generating..."),
-        kwargs={"stream": _status_stream(config)},
+        kwargs={"stream": status_stream or _status_stream(config)},
         daemon=True,
     )
     spinner_thread.start()

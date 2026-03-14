@@ -13,6 +13,8 @@ type SessionPayload = {
     metadata?: Record<string, unknown>;
   } | null;
   last_error: string | null;
+  model_loaded: boolean;
+  history: Array<{ id: string; completed_at: number; payload: Record<string, unknown> }>;
   config: Record<string, unknown>;
   stderr_tail: string[];
 };
@@ -175,7 +177,7 @@ mainWindow = new BrowserWindow({
   url: "views://mainview/index.html",
   frame: {
     width: 420,
-    height: 560,
+    height: 500,
     x: 220,
     y: 120,
   },
