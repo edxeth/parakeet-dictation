@@ -67,6 +67,11 @@ const electrobun = new Electrobun.Electroview({ rpc });
 const busyOverlay = document.getElementById("busyOverlay") as HTMLDivElement;
 const busyTitle = document.getElementById("busyTitle") as HTMLDivElement;
 const busyMessage = document.getElementById("busyMessage") as HTMLDivElement;
+const confirmOverlay = document.getElementById("confirmOverlay") as HTMLDivElement;
+const confirmTitle = document.getElementById("confirmTitle") as HTMLDivElement;
+const confirmMessage = document.getElementById("confirmMessage") as HTMLDivElement;
+const confirmCancelButton = document.getElementById("confirmCancelButton") as HTMLButtonElement;
+const confirmOkButton = document.getElementById("confirmOkButton") as HTMLButtonElement;
 const appShell = document.getElementById("appShell") as HTMLDivElement;
 const statusBadge = document.getElementById("statusBadge") as HTMLDivElement;
 const hotkeyValue = document.getElementById("hotkeyValue") as HTMLDivElement;
@@ -120,6 +125,32 @@ function setOverlay(visible: boolean, title = "Working…", message = "Please wa
   busyOverlay.setAttribute("aria-hidden", visible ? "false" : "true");
   busyTitle.textContent = title;
   busyMessage.textContent = message;
+}
+
+function confirmAction(title: string, message: string): Promise<boolean> {
+  confirmTitle.textContent = title;
+  confirmMessage.textContent = message;
+  confirmOverlay.classList.remove("hidden");
+  confirmOverlay.setAttribute("aria-hidden", "false");
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      confirmOverlay.classList.add("hidden");
+      confirmOverlay.setAttribute("aria-hidden", "true");
+      confirmCancelButton.removeEventListener("click", onCancel);
+      confirmOkButton.removeEventListener("click", onOk);
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(false);
+    };
+    const onOk = () => {
+      cleanup();
+      resolve(true);
+    };
+    confirmCancelButton.addEventListener("click", onCancel, { once: true });
+    confirmOkButton.addEventListener("click", onOk, { once: true });
+  });
 }
 
 async function copyTranscript(text: string) {
@@ -253,7 +284,10 @@ async function toggleRecording() {
 }
 
 async function clearHistory() {
-  const shouldClear = window.confirm("Clear all transcription history for this bridge session?");
+  const shouldClear = await confirmAction(
+    "Clear history?",
+    "Clear all transcription history for this bridge session? This cannot be undone.",
+  );
   if (!shouldClear) return;
   setBusy(true);
   try {

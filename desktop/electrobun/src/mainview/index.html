@@ -14,6 +14,16 @@
         <div id="busyMessage" class="busy-message">Please wait.</div>
       </div>
     </div>
+    <div id="confirmOverlay" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal-card">
+        <div id="confirmTitle" class="modal-title">Clear history?</div>
+        <div id="confirmMessage" class="modal-message">Clear all transcription history for this bridge session?</div>
+        <div class="modal-actions">
+          <button id="confirmCancelButton" class="secondary">Cancel</button>
+          <button id="confirmOkButton" class="primary danger">Clear</button>
+        </div>
+      </div>
+    </div>
     <div class="app" id="appShell">
       <header class="hero">
         <div>

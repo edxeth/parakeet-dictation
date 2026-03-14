@@ -37,7 +37,8 @@ body {
   user-select: none;
 }
 
-.busy-overlay {
+.busy-overlay,
+.modal-overlay {
   position: absolute;
   inset: 0;
   display: flex;
@@ -48,14 +49,16 @@ body {
   background: rgba(8, 10, 20, 0.38);
 }
 
-.busy-overlay.hidden {
+.busy-overlay.hidden,
+.modal-overlay.hidden {
   display: none;
 }
 
-.busy-card {
+.busy-card,
+.modal-card {
   min-width: 260px;
   max-width: 360px;
-  background: rgba(18, 24, 44, 0.96);
+  background: rgba(18, 24, 44, 0.98);
   border: 1px solid rgba(142, 156, 255, 0.24);
   border-radius: 16px;
   padding: 20px;
@@ -81,10 +84,29 @@ body {
   font-size: 16px;
 }
 
-.busy-message {
+.busy-message,
+.modal-message {
   color: #c7d2fe;
   font-size: 13px;
   line-height: 1.4;
+}
+
+.modal-title {
+  font-weight: 800;
+  font-size: 18px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  width: 100%;
+  margin-top: 6px;
+}
+
+button.danger {
+  background: linear-gradient(135deg, #dc2626, #ef4444);
+  color: white;
 }
 
 .hero,
