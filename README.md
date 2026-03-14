@@ -179,6 +179,12 @@ Start the backend bridge in WSL first:
 parakeet bridge --host 127.0.0.1 --port 8765
 ```
 
+If you run the Electrobun app on Linux/WSL, install its tray/runtime dependency once:
+
+```bash
+sudo apt install -y libayatana-appindicator3-1
+```
+
 Then launch the desktop app from `desktop/electrobun/`:
 
 ```bash

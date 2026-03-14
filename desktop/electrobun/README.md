@@ -21,6 +21,12 @@ source .venv/bin/activate
 parakeet bridge --host 127.0.0.1 --port 8765
 ```
 
+On Ubuntu/WSL/Linux hosts running the Electrobun app, install the tray/runtime dependency once:
+
+```bash
+sudo apt install -y libayatana-appindicator3-1
+```
+
 Then launch the desktop app from this folder:
 
 ```bash
