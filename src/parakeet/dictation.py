@@ -20,7 +20,7 @@ import wave
 from contextlib import nullcontext
 from typing import Any, cast
 
-from parakeet.audio import list_input_devices
+from parakeet.audio import VAD_FRAME_SAMPLES, build_vad_backend, list_input_devices, record_until_vad_stop
 from parakeet.config import resolve_config
 from parakeet.errors import (
     AUDIO_BACKEND_UNREACHABLE,
@@ -270,6 +270,14 @@ def wait_for_enter_interruptible(show_prompt: bool = False, *, stream=None) -> b
     return False
 
 
+def _manual_stop_requested(timeout: float = 0.0) -> bool:
+    readable, _, _ = select.select([sys.stdin], [], [], timeout)
+    if readable:
+        sys.stdin.readline()
+        return True
+    return False
+
+
 def save_audio(audio_data: bytes, filename: str, sample_rate: int = 16000) -> None:
     with wave.open(filename, "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -317,6 +325,7 @@ def record_audio_interruptible(
     sample_rate: int = 16000,
 ) -> bytes | None:
     status_stream = _status_stream(config)
+    frames_per_buffer = VAD_FRAME_SAMPLES if config.vad else 1024
     ctx = SilentSTDERR() if not config.debug else nullcontext()
     with ctx:
         pa = pyaudio_module.PyAudio()
@@ -327,7 +336,7 @@ def record_audio_interruptible(
                 rate=sample_rate,
                 input=True,
                 input_device_index=config.input_device if isinstance(config.input_device, int) else None,
-                frames_per_buffer=1024,
+                frames_per_buffer=frames_per_buffer,
             )
         except Exception as exc:
             error = AudioError(AUDIO_BACKEND_UNREACHABLE, str(exc))
@@ -338,27 +347,46 @@ def record_audio_interruptible(
                 pass
             return None
 
-    frames: list[bytes] = []
+    audio_data: bytes | None = None
     print("🎤 Recording...", file=status_stream, flush=True)
 
     ctx = SilentSTDERR() if not config.debug else nullcontext()
     with ctx:
-        while not _shutdown_event.is_set():
-            readable, _, _ = select.select([sys.stdin], [], [], 0.01)
-            if readable:
-                sys.stdin.readline()
-                break
-            try:
-                data = stream.read(1024, exception_on_overflow=False)
-                frames.append(data)
-            except Exception:
-                continue
+        try:
+            if config.vad:
+                try:
+                    vad_backend = build_vad_backend(config.vad_mode)
+                except Exception as exc:
+                    error = AudioError(AUDIO_BACKEND_UNREACHABLE, f"WebRTC VAD unavailable: {exc}")
+                    print(f"❌ Audio error: {error}", file=status_stream)
+                    return None
 
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+                audio_data = record_until_vad_stop(
+                    stream,
+                    vad=vad_backend,
+                    stop_requested=lambda: _shutdown_event.is_set() or _manual_stop_requested(),
+                    min_speech_ms=config.min_speech_ms,
+                    max_silence_ms=config.max_silence_ms,
+                    sample_rate=sample_rate,
+                    frame_samples=VAD_FRAME_SAMPLES,
+                )
+            else:
+                frames: list[bytes] = []
+                while not _shutdown_event.is_set():
+                    if _manual_stop_requested(0.01):
+                        break
+                    try:
+                        data = stream.read(1024, exception_on_overflow=False)
+                        frames.append(data)
+                    except Exception:
+                        continue
+                audio_data = b"".join(frames)
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
 
-    return b"".join(frames) if frames else None
+    return audio_data or None
 
 
 def _load_model(config: DictationConfig, nemo_asr: Any, torch_module: Any) -> tuple[TranscriptionEngine, bool, float, float]:

@@ -119,7 +119,7 @@
         "Confirm auto-stop triggers only after cumulative voiced duration reaches the configured threshold and the required silence window elapses",
         "Run the no-voiced-frame scenario and confirm the session remains manual-stop only rather than stopping automatically"
       ],
-      "passes": false,
+      "passes": true,
       "regression_notes": ""
     },
     {

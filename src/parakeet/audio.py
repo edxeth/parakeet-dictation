@@ -1,4 +1,4 @@
-"""Audio device enumeration helpers for Parakeet."""
+"""Audio device enumeration helpers and VAD capture utilities for Parakeet."""
 
 from __future__ import annotations
 
@@ -6,12 +6,35 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-from parakeet.types import AudioDevice
+from parakeet.types import AudioDevice, VadBackend
 
 
 PyAudioModule = Any
+VAD_SAMPLE_RATE = 16000
+VAD_FRAME_MS = 30
+VAD_FRAME_SAMPLES = int(VAD_SAMPLE_RATE * VAD_FRAME_MS / 1000)
+VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2
+
+
+class WebRtcVadBackend:
+    """Small adapter around a WebRTC-compatible VAD implementation."""
+
+    name = "webrtc"
+
+    def __init__(self, mode: int = 2, *, webrtcvad_module: Any | None = None) -> None:
+        if webrtcvad_module is None:
+            import webrtcvad as webrtcvad_module
+
+        self._vad = webrtcvad_module.Vad(mode)
+
+    def is_speech(self, frame: bytes, sample_rate: int) -> bool:
+        return bool(self._vad.is_speech(frame, sample_rate))
+
+
+def build_vad_backend(mode: int = 2) -> VadBackend:
+    return WebRtcVadBackend(mode)
 
 
 def _load_pyaudio_module(pyaudio_module: PyAudioModule | None = None) -> PyAudioModule:
@@ -87,6 +110,59 @@ def _classify_probe_failure(output: str) -> str:
     if any(marker in lowered for marker in _CONNECTION_FAILURE_MARKERS):
         return "unreachable"
     return "unknown"
+
+
+def _normalize_vad_frame(frame: bytes) -> bytes:
+    if len(frame) == VAD_FRAME_BYTES:
+        return frame
+    if len(frame) > VAD_FRAME_BYTES:
+        return frame[:VAD_FRAME_BYTES]
+    return frame.ljust(VAD_FRAME_BYTES, b"\x00")
+
+
+def record_until_vad_stop(
+    stream: Any,
+    *,
+    vad: VadBackend,
+    stop_requested: Callable[[], bool],
+    min_speech_ms: int,
+    max_silence_ms: int,
+    sample_rate: int = VAD_SAMPLE_RATE,
+    frame_samples: int = VAD_FRAME_SAMPLES,
+) -> bytes:
+    if sample_rate != VAD_SAMPLE_RATE:
+        raise ValueError(f"VAD capture requires {VAD_SAMPLE_RATE} Hz audio")
+
+    frames: list[bytes] = []
+    cumulative_voiced_ms = 0
+    consecutive_silence_ms = 0
+    speech_detected = False
+
+    while True:
+        if stop_requested():
+            break
+
+        data = stream.read(frame_samples, exception_on_overflow=False)
+        if not data:
+            continue
+
+        frames.append(data)
+        is_speech = vad.is_speech(_normalize_vad_frame(data), sample_rate)
+        if is_speech:
+            speech_detected = True
+            cumulative_voiced_ms += VAD_FRAME_MS
+            consecutive_silence_ms = 0
+            continue
+
+        if not speech_detected or cumulative_voiced_ms < min_speech_ms:
+            consecutive_silence_ms = 0
+            continue
+
+        consecutive_silence_ms += VAD_FRAME_MS
+        if consecutive_silence_ms >= max_silence_ms:
+            break
+
+    return b"".join(frames)
 
 
 def probe_audio_backend(
