@@ -52,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="json_output",
         help="Emit machine-readable JSON.",
     )
+    doctor_parser.add_argument(
+        "--check-model-cache",
+        action="store_true",
+        help="Check local Parakeet cache/import readiness without loading or downloading the model.",
+    )
     doctor_parser.set_defaults(handler=_run_doctor_namespace)
     return parser
 
@@ -84,7 +89,7 @@ def _run_devices_namespace(namespace: argparse.Namespace) -> int:
 
 
 def _run_doctor_namespace(namespace: argparse.Namespace) -> int:
-    report = collect_doctor_report()
+    report = collect_doctor_report(check_model_cache=bool(namespace.check_model_cache))
 
     if namespace.json_output:
         print(json.dumps(asdict(report)))

@@ -16,12 +16,12 @@ from parakeet.errors import (
     AUDIO_NO_INPUT_DEVICE,
     CLIPBOARD_UNAVAILABLE,
     CUDA_UNAVAILABLE,
+    MODEL_CACHE_MISSING,
+    MODEL_IMPORT_FAILED,
     ExitCode,
 )
+from parakeet.model import MODEL_ID, check_model_cache
 from parakeet.types import AudioDevice, DoctorIssue, DoctorReport
-
-
-MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 
 
 def _read_text(path: Path) -> str:
@@ -138,12 +138,15 @@ def _collect_cuda_status() -> dict[str, Any]:
     }
 
 
-def _collect_model_status(check_model_cache: bool) -> dict[str, Any]:
-    return {
-        "checked": bool(check_model_cache),
-        "cache_present": None,
-        "model_id": MODEL_ID,
-    }
+def _collect_model_status(check_model_cache_enabled: bool) -> dict[str, Any]:
+    if not check_model_cache_enabled:
+        return {
+            "checked": False,
+            "cache_present": None,
+            "model_id": MODEL_ID,
+        }
+
+    return check_model_cache()
 
 
 def _build_issues(
@@ -152,6 +155,7 @@ def _build_issues(
     audio_devices: Sequence[AudioDevice],
     clipboard: Mapping[str, Any],
     cuda: Mapping[str, Any],
+    model: Mapping[str, Any],
     device_error: Exception | None,
 ) -> list[DoctorIssue]:
     issues: list[DoctorIssue] = []
@@ -197,6 +201,28 @@ def _build_issues(
             )
         )
 
+    if model.get("checked") and not bool(model.get("import_ready", True)):
+        detail = model.get("import_error") or model.get("detail") or "Model imports failed"
+        issues.append(
+            DoctorIssue(
+                code=MODEL_IMPORT_FAILED,
+                severity="fail",
+                message=f"Parakeet model imports are not ready: {detail}",
+                remediation="Install the required runtime dependencies and confirm `import nemo.collections.asr` works without loading the model.",
+            )
+        )
+
+    if model.get("checked") and model.get("cache_present") is False:
+        detail = model.get("cache_path") or model.get("detail") or "Model cache is missing"
+        issues.append(
+            DoctorIssue(
+                code=MODEL_CACHE_MISSING,
+                severity="fail",
+                message=f"Local Parakeet model cache is missing: {detail}",
+                remediation="Populate the local Hugging Face cache for the Parakeet model before relying on offline readiness checks.",
+            )
+        )
+
     return issues
 
 
@@ -238,6 +264,7 @@ def collect_doctor_report(check_model_cache: bool = False) -> DoctorReport:
         audio_devices=audio_devices,
         clipboard=clipboard,
         cuda=cuda,
+        model=model,
         device_error=device_error,
     )
 
@@ -266,6 +293,11 @@ def render_doctor_text(report: DoctorReport) -> str:
         f"audio_devices: {len(report.audio_devices)}",
         f"clipboard: {report.clipboard.get('status', 'unknown')}",
         f"cuda: {'available' if report.cuda.get('available') else 'unavailable'}",
+        (
+            f"model: {'checked' if report.model.get('checked') else 'skipped'}"
+            if not report.model.get('checked')
+            else f"model: checked cache_present={report.model.get('cache_present')} import_ready={report.model.get('import_ready')}"
+        ),
     ]
 
     issues = report.status.get("issues", [])

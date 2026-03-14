@@ -64,7 +64,7 @@
         "Run the same command in a scenario where local cache or imports are unavailable and confirm the documented issue codes are surfaced deterministically",
         "Verify both paths avoid network download and full model initialization"
       ],
-      "passes": false,
+      "passes": true,
       "regression_notes": ""
     },
     {
