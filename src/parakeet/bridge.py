@@ -69,6 +69,7 @@ class DictationBridgeController:
         self._last_error: str | None = None
         self._stderr_tail: list[str] = []
         self._transcript_counter = 0
+        self._capture_started = False
 
     def _build_command(self) -> list[str]:
         command = [
@@ -123,6 +124,7 @@ class DictationBridgeController:
             self._state = "idle"
             self._last_error = None
             self._stderr_tail = []
+            self._capture_started = False
             self._stdout_thread = threading.Thread(target=self._stdout_reader, daemon=True)
             self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
             self._stdout_thread.start()
@@ -171,6 +173,7 @@ class DictationBridgeController:
                 self._state = "idle"
                 self._started_at = None
                 self._last_error = None
+                self._capture_started = False
                 self._transcript_counter += 1
                 self._result_ready.notify_all()
 
@@ -202,6 +205,8 @@ class DictationBridgeController:
                 continue
             with self._lock:
                 self._stderr_tail.append(text)
+                if "🎤 Recording..." in text:
+                    self._capture_started = True
                 if len(self._stderr_tail) > self._stderr_tail_limit:
                     self._stderr_tail = self._stderr_tail[-self._stderr_tail_limit :]
 
@@ -232,6 +237,28 @@ class DictationBridgeController:
         with self._result_ready:
             if self._state != "recording":
                 raise BridgeStateError(f"Cannot stop while session is {self._state}")
+
+            if not self._capture_started:
+                process = self._process
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        process.kill()
+                self._process = None
+                self._state = "idle"
+                self._started_at = None
+                self._last_completed_at = time.time()
+                self._last_error = None
+                self._capture_started = False
+                self._last_transcript = {
+                    "schema_version": 1,
+                    "transcript": "",
+                    "metadata": {"cancelled_before_recording": True},
+                }
+                return self.get_session_payload()
+
             counter_before = self._transcript_counter
             self._signal_stop()
             self._state = "transcribing"

@@ -62,6 +62,7 @@ class _FakeProcess:
         self.stderr = _QueueStream()
         self.stdin = _FakeStdin()
         self._transcript_count = 0
+        threading.Thread(target=lambda: self.stderr.push("🎤 Recording...\n"), daemon=True).start()
 
     def poll(self) -> int | None:
         return self.returncode
@@ -121,6 +122,7 @@ def test_bridge_controller_start_and_stop_round_trip(monkeypatch):
     )
 
     started = controller.start_session()
+    time.sleep(0.05)
     stopped = controller.stop_session()
 
     assert started["state"] == "recording"
@@ -162,6 +164,7 @@ def test_bridge_controller_toggle_cycles_sessions(monkeypatch):
     )
 
     first = controller.toggle_session()
+    time.sleep(0.05)
     second = controller.toggle_session()
     third = controller.toggle_session()
 
