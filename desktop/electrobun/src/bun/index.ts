@@ -169,7 +169,7 @@ function ensureMainWindowSize() {
 
 console.log("Creating BrowserWindow...");
 mainWindow = new BrowserWindow({
-  title: "Parakeet Desktop",
+  title: "Parakeet Dictation GUI",
   url: "views://mainview/index.html",
   frame: {
     width: MIN_WINDOW_WIDTH,
