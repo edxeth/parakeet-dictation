@@ -10,9 +10,9 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 class DesktopAppError(RuntimeError):
@@ -23,6 +23,7 @@ DEFAULT_BRIDGE_HOST = "127.0.0.1"
 DEFAULT_BRIDGE_PORT = 8765
 DEFAULT_GUI_SMOKE_TIMEOUT_SECONDS = 120.0
 DEFAULT_GUI_AUTO_EXIT_MS = 1500
+DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS = 10.0
 
 
 def repo_root() -> Path:
@@ -349,6 +350,28 @@ def launch_wsl_windows_executable(
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
 ) -> subprocess.Popen[str]:
+    powershell_path = find_windows_powershell()
+    if powershell_path is not None and str(executable_path).startswith("/mnt/"):
+        script_parts: list[str] = []
+        if cwd is not None:
+            script_parts.append(f"Set-Location -LiteralPath '{_powershell_quote(windows_path_from_wsl(cwd))}'")
+        for name, value in (env or {}).items():
+            script_parts.append(f"$env:{name} = '{_powershell_quote(value)}'")
+        script_parts.append(f"& '{_powershell_quote(windows_path_from_wsl(executable_path))}'")
+        return subprocess.Popen(
+            [
+                powershell_path,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "; ".join(script_parts),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
@@ -502,6 +525,211 @@ def wait_for_shutdown_reason(path: Path, *, timeout_seconds: float) -> dict[str,
     if last_payload is not None:
         raise DesktopAppError(f"Packaged Windows app did not record a shutdown reason: {json.dumps(last_payload)}")
     raise DesktopAppError(f"Packaged Windows app did not update shutdown diagnostics at {path} within {timeout_seconds} seconds.")
+
+
+def reserve_localhost_port() -> int:
+    powershell_path = find_windows_powershell()
+    if powershell_path is not None:
+        output = run_text_command(
+            [
+                powershell_path,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "; ".join(
+                    [
+                        "$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('127.0.0.1'), 0)",
+                        "$listener.Start()",
+                        "$port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port",
+                        "$listener.Stop()",
+                        "Write-Output $port",
+                    ]
+                ),
+            ]
+        )
+        return int(output.splitlines()[-1].strip())
+
+    with subprocess.Popen(
+        ["python3", "-c", "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as completed:
+        stdout, stderr = completed.communicate()
+        if completed.returncode != 0:
+            raise DesktopAppError(stderr.strip() or "Failed to reserve a localhost port for GUI automation.")
+        return int(stdout.strip())
+
+
+def gui_e2e_base_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def request_gui_e2e_json(
+    port: int,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = Request(
+        f"{gui_e2e_base_url(port)}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace").strip()
+        raise DesktopAppError(detail or f"GUI automation request failed: {error.code}") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise DesktopAppError(f"GUI automation request failed for {path}: {error}") from error
+
+    decoded = json.loads(body) if body else {}
+    if not isinstance(decoded, dict):
+        raise DesktopAppError(f"GUI automation response at {path} was not a JSON object.")
+    return decoded
+
+
+def wait_for_gui_e2e_state(
+    port: int,
+    predicate: Callable[[dict[str, Any]], bool],
+    *,
+    timeout_seconds: float = DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS,
+    poll_interval: float = 0.25,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        payload = request_gui_e2e_json(port, "/state", timeout_seconds=poll_interval)
+        state = payload.get("state")
+        if isinstance(state, dict):
+            last_state = state
+            if predicate(state):
+                return state
+        time.sleep(poll_interval)
+    if last_state is not None:
+        raise DesktopAppError(f"GUI automation state did not reach the expected condition: {json.dumps(last_state)}")
+    raise DesktopAppError(f"GUI automation state was unavailable on port {port} within {timeout_seconds} seconds.")
+
+
+def invoke_gui_e2e_action(
+    port: int,
+    action: str,
+    *,
+    timeout_seconds: float = DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    payload = request_gui_e2e_json(port, f"/actions/{action}", method="POST", payload={}, timeout_seconds=timeout_seconds)
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        raise DesktopAppError(f"GUI automation action `{action}` did not return state.")
+    return state
+
+
+def run_gui_package_automation_command(namespace: Any) -> int:
+    payload = build_windows_package_payload()
+    stage_root = Path(payload["stage_root"])
+    smoke_paths = build_gui_smoke_paths(stage_root)
+    timeout_seconds = float(getattr(namespace, "timeout_seconds", DEFAULT_GUI_SMOKE_TIMEOUT_SECONDS))
+    automation_port = int(getattr(namespace, "automation_port", 0)) or reserve_localhost_port()
+
+    installed_paths = installed_windows_app_paths(str(payload["app_identifier"]), str(payload["app_channel"]))
+    prepare_installed_windows_app_for_reinstall(installed_paths)
+    clear_existing_gui_startup_logs(installed_paths)
+
+    installer_completed = run_wsl_windows_executable_capture(
+        Path(payload["installer_path"]),
+        timeout_seconds=timeout_seconds,
+    )
+    smoke_paths["installer_stdout_path"].write_text(installer_completed.stdout, encoding="utf-8")
+    smoke_paths["installer_stderr_path"].write_text(installer_completed.stderr, encoding="utf-8")
+    if installer_completed.returncode != 0:
+        raise DesktopAppError(
+            f"Packaged Windows installer exited with code {installer_completed.returncode}. See {smoke_paths['installer_stdout_path']} and {smoke_paths['installer_stderr_path']}."
+        )
+    if not installed_paths["launcher_path"].exists():
+        raise DesktopAppError(f"Installed Windows launcher not found at {installed_paths['launcher_path']}")
+
+    launcher_process = launch_wsl_windows_executable(
+        installed_paths["launcher_path"],
+        env={
+            "PARAKEET_GUI_E2E": "1",
+            "PARAKEET_GUI_E2E_PORT": str(automation_port),
+        },
+    )
+    initial_state: dict[str, Any] | None = None
+    show_window_state: dict[str, Any] | None = None
+    tray_open_state: dict[str, Any] | None = None
+    quit_state: dict[str, Any] | None = None
+    try:
+        wait_for_startup_readiness(installed_paths["diagnostics_path"], timeout_seconds=timeout_seconds)
+        initial_state = wait_for_gui_e2e_state(
+            automation_port,
+            lambda state: bool(state.get("diagnostics", {}).get("automationReady")),
+            timeout_seconds=timeout_seconds,
+        )
+        show_window_state = invoke_gui_e2e_action(automation_port, "show-window")
+        tray_open_state = invoke_gui_e2e_action(automation_port, "tray/open")
+        quit_state = invoke_gui_e2e_action(automation_port, "quit")
+        launcher_process.wait(timeout=10)
+        diagnostics = wait_for_shutdown_reason(installed_paths["diagnostics_path"], timeout_seconds=10.0)
+    finally:
+        if launcher_process.poll() is None:
+            try:
+                launcher_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                launcher_process.terminate()
+                try:
+                    launcher_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    launcher_process.kill()
+                    launcher_process.wait(timeout=5)
+
+    launcher_stdout, launcher_stderr = launcher_process.communicate()
+    smoke_paths["launcher_stdout_path"].write_text(launcher_stdout, encoding="utf-8")
+    smoke_paths["launcher_stderr_path"].write_text(launcher_stderr, encoding="utf-8")
+
+    if installed_paths["log_path"].exists():
+        shutil.copy2(installed_paths["log_path"], smoke_paths["log_path"])
+    if installed_paths["diagnostics_path"].exists():
+        shutil.copy2(installed_paths["diagnostics_path"], smoke_paths["diagnostics_path"])
+
+    payload.update(
+        {
+            "smoke_dir": str(smoke_paths["smoke_dir"]),
+            "windows_smoke_dir": windows_path_from_wsl(smoke_paths["smoke_dir"]),
+            "diagnostics_path": str(smoke_paths["diagnostics_path"]),
+            "windows_diagnostics_path": windows_path_from_wsl(smoke_paths["diagnostics_path"]),
+            "log_path": str(smoke_paths["log_path"]),
+            "windows_log_path": windows_path_from_wsl(smoke_paths["log_path"]),
+            "installer_stdout_path": str(smoke_paths["installer_stdout_path"]),
+            "installer_stderr_path": str(smoke_paths["installer_stderr_path"]),
+            "launcher_stdout_path": str(smoke_paths["launcher_stdout_path"]),
+            "launcher_stderr_path": str(smoke_paths["launcher_stderr_path"]),
+            "installed_launcher_path": str(installed_paths["launcher_path"]),
+            "windows_installed_launcher_path": windows_path_from_wsl(installed_paths["launcher_path"]),
+            "launcher_exit_code": launcher_process.returncode,
+            "automation_port": automation_port,
+            "initial_state": initial_state,
+            "show_window_state": show_window_state,
+            "tray_open_state": tray_open_state,
+            "quit_state": quit_state,
+            "startup_diagnostics": diagnostics,
+        }
+    )
+
+    if bool(getattr(namespace, "json_output", False)):
+        print(json.dumps(payload))
+        return 0
+
+    print(f"Packaged Windows desktop app automation check passed with diagnostics at {payload['diagnostics_path']}")
+    print(payload["windows_diagnostics_path"])
+    return 0
 
 
 def run_gui_package_smoke_command(namespace: Any) -> int:

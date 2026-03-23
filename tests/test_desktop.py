@@ -123,6 +123,23 @@ def test_gui_package_smoke_subcommand_dispatches_to_desktop_smoke_runner(monkeyp
     assert calls[0].auto_exit_ms == 900
 
 
+def test_gui_package_automation_subcommand_dispatches_to_desktop_automation_runner(monkeypatch):
+    calls: list[SimpleNamespace] = []
+
+    def _fake_automation(namespace):
+        calls.append(namespace)
+        return 0
+
+    monkeypatch.setattr("parakeet.desktop.run_gui_package_automation_command", _fake_automation)
+
+    assert main(["gui-package-automation", "--json", "--timeout-seconds", "20", "--automation-port", "49001"]) == 0
+    assert len(calls) == 1
+    assert calls[0].command == "gui-package-automation"
+    assert calls[0].json_output is True
+    assert calls[0].timeout_seconds == 20
+    assert calls[0].automation_port == 49001
+
+
 def test_gui_bridge_flag_delegates_to_full_command(monkeypatch):
     monkeypatch.setattr("parakeet.desktop.run_full_command", lambda namespace: 7)
 
@@ -322,4 +339,113 @@ def test_run_gui_package_smoke_command_launches_packaged_app_and_validates_diagn
     assert popen_factory.calls[0].env["PARAKEET_GUI_E2E"] == "1"
     assert popen_factory.calls[0].env["PARAKEET_GUI_AUTO_EXIT_MS"] == "900"
     assert (stage_root / "smoke" / "installer.stdout.log").read_text(encoding="utf-8") == "installer ok"
+    assert (stage_root / "smoke" / "startup-diagnostics.json").exists()
+
+
+def test_run_gui_package_automation_command_launches_packaged_app_and_uses_localhost_hooks(monkeypatch, tmp_path: Path):
+    stage_root = tmp_path / "stage-root"
+    stage_root.mkdir(parents=True)
+    installed_root = tmp_path / "installed" / "stable"
+    launcher_path = installed_root / "app" / "bin" / "launcher.exe"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_text("launcher")
+    diagnostics_path = installed_root / "logs" / "startup-diagnostics.json"
+    diagnostics_path.parent.mkdir(parents=True)
+    log_path = installed_root / "logs" / "startup.log"
+
+    monkeypatch.setattr(
+        desktop,
+        "build_windows_package_payload",
+        lambda: {
+            "stage_root": str(stage_root),
+            "installer_path": str(stage_root / "parakeet-desktop-Setup.exe"),
+            "app_identifier": "parakeet.desktop.local",
+            "app_channel": "stable",
+        },
+    )
+    monkeypatch.setattr(
+        desktop,
+        "installed_windows_app_paths",
+        lambda identifier, channel: {
+            "app_root": installed_root,
+            "app_dir": installed_root / "app",
+            "launcher_path": launcher_path,
+            "logs_dir": installed_root / "logs",
+            "diagnostics_path": diagnostics_path,
+            "log_path": log_path,
+        },
+    )
+    monkeypatch.setattr(desktop, "windows_path_from_wsl", lambda path: f"C:\\stage\\{path.name}")
+    monkeypatch.setattr(desktop, "prepare_installed_windows_app_for_reinstall", lambda installed_paths: None)
+
+    installer_calls: list[tuple[Path, float]] = []
+
+    def _fake_run_wsl_windows_executable_capture(executable_path: Path, *, timeout_seconds: float, env=None, cwd=None):
+        installer_calls.append((executable_path, timeout_seconds))
+        return _FakeCompletedProcess(returncode=0, stdout="installer ok", stderr="")
+
+    monkeypatch.setattr(desktop, "run_wsl_windows_executable_capture", _fake_run_wsl_windows_executable_capture)
+
+    popen_factory = _PopenFactory()
+
+    def _fake_launch_wsl_windows_executable(executable_path: Path, *, env=None, cwd=None):
+        diagnostics_path.write_text(
+            json.dumps(
+                {
+                    "bunReady": True,
+                    "rendererReady": True,
+                    "rendererRpcReady": True,
+                    "automationReady": True,
+                    "shutdownReason": "automation:quit",
+                }
+            ),
+            encoding="utf-8",
+        )
+        log_path.write_text("automation ready", encoding="utf-8")
+        process = popen_factory([str(executable_path)], env=env, cwd=cwd)
+        process.returncode = 0
+        return process
+
+    monkeypatch.setattr(desktop, "launch_wsl_windows_executable", _fake_launch_wsl_windows_executable)
+    monkeypatch.setattr(desktop, "reserve_localhost_port", lambda: 49011)
+
+    state_requests: list[str] = []
+    action_requests: list[str] = []
+
+    def _fake_wait_for_gui_e2e_state(port: int, predicate, *, timeout_seconds: float, poll_interval: float = 0.25):
+        state = {
+            "diagnostics": {"automationReady": True},
+            "tray": {"created": True, "actions": ["open", "toggle", "quit"]},
+            "hotkey": {"accelerator": "CommandOrControl+Alt+R", "registered": True},
+            "renderer": {"ready": True, "rpcReady": True, "userAgent": "test-agent"},
+            "bridge": {"connected": False},
+        }
+        state_requests.append(f"state:{port}:{timeout_seconds}")
+        assert predicate(state) is True
+        return state
+
+    def _fake_invoke_gui_e2e_action(port: int, action: str, *, timeout_seconds: float = desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS):
+        action_requests.append(f"{port}:{action}:{timeout_seconds}")
+        return {"diagnostics": {"lastAutomationAction": action}}
+
+    monkeypatch.setattr(desktop, "wait_for_gui_e2e_state", _fake_wait_for_gui_e2e_state)
+    monkeypatch.setattr(desktop, "invoke_gui_e2e_action", _fake_invoke_gui_e2e_action)
+
+    namespace = SimpleNamespace(json_output=False, timeout_seconds=12.0, automation_port=0)
+    assert desktop.run_gui_package_automation_command(namespace) == 0
+    assert installer_calls == [(
+        stage_root / "parakeet-desktop-Setup.exe",
+        12.0,
+    )]
+    assert len(popen_factory.calls) == 1
+    assert popen_factory.calls[0].command == [str(launcher_path)]
+    assert popen_factory.calls[0].env is not None
+    assert popen_factory.calls[0].env["PARAKEET_GUI_E2E"] == "1"
+    assert popen_factory.calls[0].env["PARAKEET_GUI_E2E_PORT"] == "49011"
+    assert state_requests == ["state:49011:12.0"]
+    assert action_requests == [
+        f"49011:show-window:{desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS}",
+        f"49011:tray/open:{desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS}",
+        f"49011:quit:{desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS}",
+    ]
     assert (stage_root / "smoke" / "startup-diagnostics.json").exists()

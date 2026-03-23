@@ -48,8 +48,8 @@
         "Launch the Windows app with automation env vars enabled.",
         "Read app state and invoke only user-equivalent actions through the automation surface."
       ],
-      "passes": false,
-      "regression_notes": ""
+      "passes": true,
+      "regression_notes": "Verified with `.venv/bin/python -m parakeet.cli gui-package-automation --json --timeout-seconds 120`, which packaged and installed the Windows app, launched it with `PARAKEET_GUI_E2E=1` plus a Windows-selected localhost port, read `/state`, invoked `show-window`, `tray/open`, and `quit` over the localhost automation server, and captured diagnostics showing `automationReady=true`, tray/hotkey state, and `shutdownReason=automation:quit`. Regression check: `.venv/bin/python -m parakeet.cli gui-package-smoke --json --timeout-seconds 120` still passed with `shutdownReason=e2e-auto-exit`."
     },
     {
       "category": "functional",

@@ -39,6 +39,9 @@ type StartupDiagnostics = {
   bridgeUrl: string;
   hotkey: string;
   e2eEnabled: boolean;
+  automationPort: number | null;
+  automationReady: boolean;
+  automationReadyAt: string | null;
   bunReady: boolean;
   bunReadyAt: string;
   trayCreated: boolean;
@@ -49,9 +52,42 @@ type StartupDiagnostics = {
   rendererReadyAt: string | null;
   rendererRpcReady: boolean;
   rendererUserAgent: string | null;
+  lastAutomationAction: string | null;
   shutdownReason: string | null;
   shutdownAt: string | null;
   lastError: string | null;
+};
+
+type AutomationActionId =
+  | "show-window"
+  | "start-recording"
+  | "stop-recording"
+  | "toggle-recording"
+  | "clear-history"
+  | "tray/open"
+  | "tray/toggle"
+  | "tray/quit"
+  | "hotkey/trigger"
+  | "quit";
+
+type AutomationState = {
+  enabled: boolean;
+  port: number | null;
+  tray: {
+    created: boolean;
+    actions: string[];
+  };
+  hotkey: {
+    accelerator: string;
+    registered: boolean;
+  };
+  renderer: {
+    ready: boolean;
+    rpcReady: boolean;
+    userAgent: string | null;
+  };
+  bridge: BridgeViewState;
+  diagnostics: StartupDiagnostics;
 };
 
 type DesktopRPC = {
@@ -77,6 +113,7 @@ const BRIDGE_URL = Bun.env.PARAKEET_BRIDGE_URL || "http://127.0.0.1:8765";
 const HOTKEY = Bun.env.PARAKEET_HOTKEY || "CommandOrControl+Alt+R";
 const BRIDGE_START_COMMAND = Bun.env.PARAKEET_BRIDGE_COMMAND || "parakeet bridge --host 127.0.0.1 --port 8765";
 const GUI_E2E_ENABLED = Bun.env.PARAKEET_GUI_E2E === "1";
+const GUI_E2E_PORT = Number(Bun.env.PARAKEET_GUI_E2E_PORT || "0") || 0;
 const DEFAULT_STARTUP_LOG_DIR = Bun.env.LOCALAPPDATA
   ? join(Bun.env.LOCALAPPDATA, "parakeet.desktop.local", "stable", "logs")
   : "";
@@ -106,6 +143,9 @@ const startupDiagnostics: StartupDiagnostics = {
   bridgeUrl: BRIDGE_URL,
   hotkey: HOTKEY,
   e2eEnabled: GUI_E2E_ENABLED,
+  automationPort: GUI_E2E_PORT > 0 ? GUI_E2E_PORT : null,
+  automationReady: false,
+  automationReadyAt: null,
   bunReady: true,
   bunReadyAt: timestamp(),
   trayCreated: false,
@@ -116,6 +156,7 @@ const startupDiagnostics: StartupDiagnostics = {
   rendererReadyAt: null,
   rendererRpcReady: false,
   rendererUserAgent: null,
+  lastAutomationAction: null,
   shutdownReason: null,
   shutdownAt: null,
   lastError: null,
@@ -201,9 +242,57 @@ async function readBridgeState(): Promise<BridgeViewState> {
   }
 }
 
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function isAutomationAction(value: string): value is AutomationActionId {
+  return [
+    "show-window",
+    "start-recording",
+    "stop-recording",
+    "toggle-recording",
+    "clear-history",
+    "tray/open",
+    "tray/toggle",
+    "tray/quit",
+    "hotkey/trigger",
+    "quit",
+  ].includes(value);
+}
+
+async function readAutomationState(): Promise<AutomationState> {
+  return {
+    enabled: GUI_E2E_ENABLED,
+    port: GUI_E2E_PORT > 0 ? GUI_E2E_PORT : null,
+    tray: {
+      created: startupDiagnostics.trayCreated,
+      actions: ["open", "toggle", "quit"],
+    },
+    hotkey: {
+      accelerator: HOTKEY,
+      registered: startupDiagnostics.hotkeyRegistered,
+    },
+    renderer: {
+      ready: startupDiagnostics.rendererReady,
+      rpcReady: startupDiagnostics.rendererRpcReady,
+      userAgent: startupDiagnostics.rendererUserAgent,
+    },
+    bridge: await readBridgeState(),
+    diagnostics: { ...startupDiagnostics },
+  };
+}
+
 let mainWindow: BrowserWindow<any> | null = null;
 let tray: Tray | null = null;
 let autoExitTimer: ReturnType<typeof setTimeout> | null = null;
+let automationServer: ReturnType<typeof Bun.serve> | null = null;
 let shuttingDown = false;
 
 function exitApp(reason: string, exitCode = 0) {
@@ -220,6 +309,7 @@ function exitApp(reason: string, exitCode = 0) {
     shutdownAt: timestamp(),
   });
   appendGuiLog("INFO", `Shutting down app: ${reason}`);
+  automationServer?.stop(true);
   GlobalShortcut.unregisterAll();
   tray?.remove();
   process.exit(exitCode);
@@ -284,9 +374,7 @@ mainWindow = new BrowserWindow({
           return await readBridgeState();
         },
         showWindow: async () => {
-          ensureMainWindowSize();
-          mainWindow?.show();
-          mainWindow?.focus();
+          showMainWindow();
           return { success: true } as const;
         },
         reportRendererReady: async ({ userAgent }) => {
@@ -326,6 +414,111 @@ function ensureMainWindowSize() {
   }
 }
 
+function showMainWindow() {
+  ensureMainWindowSize();
+  mainWindow?.show();
+  mainWindow?.focus();
+}
+
+async function triggerHotkeyCallback() {
+  appendGuiLog("INFO", `Hotkey callback invoked: ${HOTKEY}`);
+  await toggleFromBackground();
+}
+
+function triggerQuit(action: string) {
+  setTimeout(() => {
+    exitApp(action);
+  }, 0);
+}
+
+async function runAutomationAction(action: AutomationActionId): Promise<AutomationState> {
+  updateStartupDiagnostics({ lastAutomationAction: action });
+  appendGuiLog("INFO", `Automation action: ${action}`);
+
+  switch (action) {
+    case "show-window":
+    case "tray/open":
+      showMainWindow();
+      break;
+    case "start-recording":
+      await fetchBridgeJson("/session/start", { method: "POST", body: "{}" });
+      break;
+    case "stop-recording":
+      await fetchBridgeJson("/session/stop", { method: "POST", body: "{}" });
+      break;
+    case "toggle-recording":
+      await fetchBridgeJson("/session/toggle", { method: "POST", body: "{}" });
+      break;
+    case "clear-history":
+      await fetchBridgeJson("/session/clear-history", { method: "POST", body: "{}" });
+      break;
+    case "tray/toggle":
+      await toggleFromBackground();
+      break;
+    case "hotkey/trigger":
+      await triggerHotkeyCallback();
+      break;
+    case "tray/quit":
+      triggerQuit("automation:tray/quit");
+      break;
+    case "quit":
+      triggerQuit("automation:quit");
+      break;
+  }
+
+  return await readAutomationState();
+}
+
+function startAutomationServer() {
+  if (!GUI_E2E_ENABLED || GUI_E2E_PORT <= 0 || automationServer) {
+    return;
+  }
+
+  appendGuiLog("INFO", `Starting automation server on http://127.0.0.1:${GUI_E2E_PORT}`);
+  try {
+    automationServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: GUI_E2E_PORT,
+      fetch: async (request) => {
+        const url = new URL(request.url);
+        try {
+          if (request.method === "GET" && url.pathname === "/health") {
+            return jsonResponse({ ok: true });
+          }
+          if (request.method === "GET" && url.pathname === "/state") {
+            return jsonResponse({ ok: true, state: await readAutomationState() });
+          }
+          if (request.method === "POST" && url.pathname.startsWith("/actions/")) {
+            const action = decodeURIComponent(url.pathname.slice("/actions/".length));
+            if (!isAutomationAction(action)) {
+              return jsonResponse({ ok: false, error: `Unknown automation action: ${action}` }, 404);
+            }
+            return jsonResponse({ ok: true, state: await runAutomationAction(action) });
+          }
+          return jsonResponse({ ok: false, error: `Unknown automation route: ${url.pathname}` }, 404);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          updateStartupDiagnostics({ lastError: message });
+          appendGuiLog("ERROR", `Automation request failed: ${message}`);
+          return jsonResponse({ ok: false, error: message }, 500);
+        }
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.stack || error.message : String(error);
+    updateStartupDiagnostics({ lastError: message });
+    appendGuiLog("ERROR", `Failed to start automation server: ${message}`);
+    return;
+  }
+
+  updateStartupDiagnostics({
+    automationPort: GUI_E2E_PORT,
+    automationReady: true,
+    automationReadyAt: timestamp(),
+  });
+  appendGuiLog("INFO", `Automation server listening on http://127.0.0.1:${GUI_E2E_PORT}`);
+}
+
 ensureMainWindowSize();
 
 tray = new Tray({ title: "Parakeet" });
@@ -346,9 +539,7 @@ tray.on("tray-clicked", async (event: any) => {
   const action = event.data?.action;
   switch (action) {
     case "open":
-      ensureMainWindowSize();
-      mainWindow?.show();
-      mainWindow?.focus();
+      showMainWindow();
       break;
     case "toggle":
       await toggleFromBackground();
@@ -361,7 +552,7 @@ tray.on("tray-clicked", async (event: any) => {
 
 appendGuiLog("INFO", "Registering global hotkey...");
 const registeredHotkey = GlobalShortcut.register(HOTKEY, () => {
-  void toggleFromBackground();
+  void triggerHotkeyCallback();
 });
 updateStartupDiagnostics({
   hotkeyRegistered: registeredHotkey,
@@ -372,6 +563,8 @@ if (!registeredHotkey) {
 } else {
   appendGuiLog("INFO", `Global hotkey registered: ${HOTKEY}`);
 }
+
+startAutomationServer();
 
 appendGuiLog("INFO", "Parakeet desktop app started");
 appendGuiLog("INFO", `Bridge URL: ${BRIDGE_URL}`);
