@@ -108,8 +108,8 @@
         "Follow the updated docs from a fresh WSL-first context to package and run the Windows GUI against the WSL bridge.",
         "Verify the docs state support boundaries, WebView2 expectations, staging behavior, and the user-controlled lifecycle."
       ],
-      "passes": false,
-      "regression_notes": ""
+      "passes": true,
+      "regression_notes": "Updated `README.md`, `desktop/electrobun/README.md`, and `sdk/electrobun.md` to document the supported Windows 11 x64 packaged GUI + WSL bridge workflow, WebView2 requirement, drive-backed staging under `%LOCALAPPDATA%\\ParakeetDictation\\staging`, user-controlled bridge lifecycle, and the single unattended verification entrypoint. Verified the documented commands from fresh WSL context with `.venv/bin/python -m compileall transcriber.py src tests`, `.venv/bin/python -m pytest -q`, `cd desktop/electrobun && bun install && bun run check`, `.venv/bin/python -m parakeet.cli bridge --host 127.0.0.1 --port 8765` (healthy in deterministic E2E mode), `.venv/bin/python -m parakeet.cli gui-package --json`, and `.venv/bin/python -m parakeet.cli gui-package-verify --json --timeout-seconds 240`."
     }
   ]
 }

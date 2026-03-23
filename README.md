@@ -1,6 +1,6 @@
 # Parakeet Dictation
 
-Packaged microphone dictation for Linux/WSL2 using NVIDIA NeMo Parakeet TDT 0.6B v3.
+Packaged microphone dictation for Linux/WSL2 with a native Windows 11 x64 Electrobun GUI that talks to a WSL bridge.
 
 Milestone 1 ships a packaged `parakeet` CLI with:
 - interactive `parakeet dictation`
@@ -12,9 +12,10 @@ Milestone 1 ships a packaged `parakeet` CLI with:
 
 ## Supported platforms
 
-- Linux: supported
-- WSL2 Ubuntu: supported
-- Windows native: not supported
+- Linux CLI/backend: supported
+- WSL2 Ubuntu CLI/backend: supported
+- Windows 11 x64 packaged GUI + WSL bridge: supported
+- Native Windows backend: not supported
 - macOS: not supported
 
 The lifecycle remains user-controlled:
@@ -175,34 +176,49 @@ Exit codes:
 
 The repo includes an Electrobun desktop app in `desktop/electrobun/` that talks to `parakeet bridge` over localhost.
 
-Recommended launch commands:
+Supported first-release Windows topology:
+- packaged Windows 11 x64 GUI on the Windows host
+- `parakeet bridge` running separately inside WSL on `127.0.0.1`
+- Microsoft Edge WebView2 runtime available on Windows
+- no native Windows backend
+- no ARM64 packaging promise yet
+
+Recommended packaged Windows workflow from WSL:
+
+1. Package the Windows app from WSL:
+
+```bash
+.venv/bin/python -m parakeet.cli gui-package --json
+```
+
+The packaging command stages `desktop/electrobun/` under `%LOCALAPPDATA%\ParakeetDictation\staging\...` before invoking Windows Bun so Windows tooling does not build from the `\\wsl.localhost\...` repo path.
+
+2. Start the bridge in WSL:
+
+```bash
+.venv/bin/python -m parakeet.cli bridge --host 127.0.0.1 --port 8765
+```
+
+3. Run the generated Windows installer shown in the `gui-package` JSON output, then launch the installed Parakeet desktop app from Windows.
+
+4. For unattended local packaging + GUI + bridge verification from WSL, run:
+
+```bash
+.venv/bin/python -m parakeet.cli gui-package-verify --json --timeout-seconds 240
+```
+
+`gui-package-verify` is the single repo-supported unattended Windows + WSL verification entrypoint. It packages the app, launches the packaged Windows GUI, exercises smoke/automation/bridge-recovery/main-window/tray/hotkey coverage, and preserves Windows diagnostics/log bundles under `%LOCALAPPDATA%\ParakeetDictation\staging\...\verify\`.
+
+Linux/WSL developer-run GUI commands still exist:
 
 ```bash
 parakeet bridge              # backend only
 parakeet gui                 # GUI only, expects an already-running bridge
-parakeet gui --bridge        # GUI + auto-start bridge
+parakeet gui --bridge        # GUI + auto-start bridge for local dev
 parakeet full                # alias for the same combined flow
 ```
 
-Equivalent manual startup still works:
-
-1. Start the bridge in WSL:
-
-```bash
-parakeet bridge --host 127.0.0.1 --port 8765
-```
-
-2. Then start the desktop app:
-
-```bash
-cd desktop/electrobun
-bun install
-bun run start
-```
-
-`parakeet gui` and `parakeet full` will automatically run `bun install` once if `desktop/electrobun/node_modules/` is missing.
-
-If you run the Electrobun app on Linux/WSL, install its tray/runtime dependency once:
+If you run the Electrobun app directly on Linux/WSL, install its tray/runtime dependency once:
 
 ```bash
 sudo apt install -y libayatana-appindicator3-1
@@ -210,7 +226,8 @@ sudo apt install -y libayatana-appindicator3-1
 
 Desktop behavior:
 - the bridge is localhost-only and opt-in
-- `parakeet gui` alone does not auto-start the bridge; use `parakeet gui --bridge` or `parakeet full` when you want one-command startup
+- the supported packaged Windows path keeps bridge startup user-controlled
+- `parakeet gui` alone does not auto-start the bridge; use `parakeet gui --bridge` or `parakeet full` only for local dev inside Linux/WSL
 - the app stays locked while the bridge is warming the model
 - transcript history is in-memory for the current bridge session only
 - the app can clear the visible transcript history
@@ -295,6 +312,8 @@ parakeet doctor --check-model-cache --json
 parakeet bridge --help
 parakeet benchmark --fixture tests/fixtures/short_16k.wav --runs 2 --json --check-expected
 cd desktop/electrobun && bun install && bun run check
+.venv/bin/python -m parakeet.cli gui-package --json
+.venv/bin/python -m parakeet.cli gui-package-verify --json --timeout-seconds 240
 ```
 
 ## Troubleshooting
