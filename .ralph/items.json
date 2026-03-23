@@ -58,8 +58,8 @@
         "Launch the GUI while the bridge is unavailable and verify a visible offline or error state plus bridge guidance.",
         "Restore the bridge and verify the GUI reconnects without restarting."
       ],
-      "passes": false,
-      "regression_notes": ""
+      "passes": true,
+      "regression_notes": "Verified with `.venv/bin/python -m parakeet.cli gui-package-bridge-recovery --json --timeout-seconds 120`, which packaged and installed the Windows app, launched it with renderer automation enabled against an unused localhost bridge URL, confirmed a visible offline state (`Disconnected`, `Bridge offline`) plus the bridge command guidance in the renderer snapshot, then started the real deterministic WSL `parakeet bridge` on that port and observed the packaged GUI reconnect without restart to a ready `Start recording` state before quitting cleanly with `shutdownReason=automation:quit`."
     },
     {
       "category": "functional",

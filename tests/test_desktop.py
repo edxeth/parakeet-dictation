@@ -140,6 +140,36 @@ def test_gui_package_automation_subcommand_dispatches_to_desktop_automation_runn
     assert calls[0].automation_port == 49001
 
 
+def test_gui_package_bridge_recovery_subcommand_dispatches_to_desktop_runner(monkeypatch):
+    calls: list[SimpleNamespace] = []
+
+    def _fake_bridge_recovery(namespace):
+        calls.append(namespace)
+        return 0
+
+    monkeypatch.setattr("parakeet.desktop.run_gui_package_bridge_recovery_command", _fake_bridge_recovery)
+
+    assert main([
+        "gui-package-bridge-recovery",
+        "--json",
+        "--timeout-seconds",
+        "21",
+        "--automation-port",
+        "49002",
+        "--host",
+        "127.0.0.1",
+        "--bridge-port",
+        "40125",
+    ]) == 0
+    assert len(calls) == 1
+    assert calls[0].command == "gui-package-bridge-recovery"
+    assert calls[0].json_output is True
+    assert calls[0].timeout_seconds == 21
+    assert calls[0].automation_port == 49002
+    assert calls[0].host == "127.0.0.1"
+    assert calls[0].bridge_port == 40125
+
+
 def test_gui_bridge_flag_delegates_to_full_command(monkeypatch):
     monkeypatch.setattr("parakeet.desktop.run_full_command", lambda namespace: 7)
 
@@ -259,6 +289,141 @@ def test_run_gui_package_command_stages_build_and_reports_artifacts(monkeypatch,
         "C:\\stage\\electrobun",
         ["bun install", "bunx electrobun build --env=stable"],
     )]
+
+
+def test_run_gui_package_bridge_recovery_command_verifies_offline_then_online(monkeypatch, tmp_path: Path):
+    stage_root = tmp_path / "stage-root"
+    stage_root.mkdir(parents=True)
+    installed_root = tmp_path / "installed" / "stable"
+    launcher_path = installed_root / "app" / "bin" / "launcher.exe"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_text("launcher")
+    diagnostics_path = installed_root / "logs" / "startup-diagnostics.json"
+    diagnostics_path.parent.mkdir(parents=True)
+    log_path = installed_root / "logs" / "startup.log"
+
+    monkeypatch.setattr(
+        desktop,
+        "build_windows_package_payload",
+        lambda: {
+            "stage_root": str(stage_root),
+            "installer_path": str(stage_root / "parakeet-desktop-Setup.exe"),
+            "app_identifier": "parakeet.desktop.local",
+            "app_channel": "stable",
+        },
+    )
+    monkeypatch.setattr(
+        desktop,
+        "installed_windows_app_paths",
+        lambda identifier, channel: {
+            "app_root": installed_root,
+            "app_dir": installed_root / "app",
+            "launcher_path": launcher_path,
+            "logs_dir": installed_root / "logs",
+            "diagnostics_path": diagnostics_path,
+            "log_path": log_path,
+        },
+    )
+    monkeypatch.setattr(desktop, "windows_path_from_wsl", lambda path: f"C:\\stage\\{path.name}")
+    monkeypatch.setattr(desktop, "prepare_installed_windows_app_for_reinstall", lambda installed_paths: None)
+    monkeypatch.setattr(desktop, "reserve_localhost_port", lambda: 49012)
+    monkeypatch.setattr(desktop, "reserve_socket_localhost_port", lambda: 40125)
+
+    installer_calls: list[tuple[Path, float]] = []
+
+    def _fake_run_wsl_windows_executable_capture(executable_path: Path, *, timeout_seconds: float, env=None, cwd=None):
+        installer_calls.append((executable_path, timeout_seconds))
+        return _FakeCompletedProcess(returncode=0, stdout="installer ok", stderr="")
+
+    monkeypatch.setattr(desktop, "run_wsl_windows_executable_capture", _fake_run_wsl_windows_executable_capture)
+
+    launcher_factory = _PopenFactory()
+
+    def _fake_launch_wsl_windows_executable(executable_path: Path, *, env=None, cwd=None):
+        diagnostics_path.write_text(
+            json.dumps(
+                {
+                    "bunReady": True,
+                    "rendererReady": True,
+                    "rendererRpcReady": True,
+                    "automationReady": True,
+                    "shutdownReason": "automation:quit",
+                }
+            ),
+            encoding="utf-8",
+        )
+        log_path.write_text("automation ready", encoding="utf-8")
+        process = launcher_factory([str(executable_path)], env=env, cwd=cwd)
+        process.returncode = 0
+        return process
+
+    monkeypatch.setattr(desktop, "launch_wsl_windows_executable", _fake_launch_wsl_windows_executable)
+    monkeypatch.setattr(desktop, "wait_for_bridge", lambda host, port, timeout_seconds=10.0, poll_interval=0.25: True)
+
+    state_requests: list[str] = []
+    expected_bridge_url = "http://127.0.0.1:40125"
+    expected_bridge_command = "parakeet bridge --host 127.0.0.1 --port 40125"
+    offline_state = {
+        "bridge": {"connected": False},
+        "renderer": {
+            "snapshot": {
+                "toggleButtonText": "Bridge offline",
+                "bridgeUrl": expected_bridge_url,
+                "bridgeCommand": expected_bridge_command,
+                "statusLine": "Start the WSL bridge command below, then use the button or hotkey.",
+            }
+        },
+    }
+    recovered_state = {
+        "bridge": {"connected": True},
+        "renderer": {
+            "snapshot": {
+                "toggleButtonText": "Start recording",
+                "bridgeUrl": expected_bridge_url,
+                "bridgeCommand": expected_bridge_command,
+                "statusLine": "Model ready. Press the button or the hotkey to begin.",
+            }
+        },
+    }
+
+    def _fake_wait_for_gui_e2e_state(port: int, predicate, *, timeout_seconds: float, poll_interval: float = 0.25):
+        state = offline_state if not state_requests else recovered_state
+        state_requests.append(f"state:{port}:{timeout_seconds}")
+        assert predicate(state) is True
+        return state
+
+    monkeypatch.setattr(desktop, "wait_for_gui_e2e_state", _fake_wait_for_gui_e2e_state)
+
+    action_requests: list[str] = []
+
+    def _fake_invoke_gui_e2e_action(port: int, action: str, *, timeout_seconds: float = desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS):
+        action_requests.append(f"{port}:{action}:{timeout_seconds}")
+        return {"diagnostics": {"lastAutomationAction": action}}
+
+    monkeypatch.setattr(desktop, "invoke_gui_e2e_action", _fake_invoke_gui_e2e_action)
+
+    bridge_factory = _PopenFactory()
+    monkeypatch.setattr(desktop.subprocess, "Popen", bridge_factory)
+
+    namespace = SimpleNamespace(json_output=False, timeout_seconds=12.0, automation_port=0, host="127.0.0.1", bridge_port=0)
+    assert desktop.run_gui_package_bridge_recovery_command(namespace) == 0
+    assert installer_calls == [(
+        stage_root / "parakeet-desktop-Setup.exe",
+        12.0,
+    )]
+    assert len(launcher_factory.calls) == 1
+    assert launcher_factory.calls[0].env is not None
+    assert launcher_factory.calls[0].env["PARAKEET_GUI_E2E_PORT"] == "49012"
+    assert launcher_factory.calls[0].env["PARAKEET_BRIDGE_URL"] == expected_bridge_url
+    assert launcher_factory.calls[0].env["PARAKEET_BRIDGE_COMMAND"] == expected_bridge_command
+    assert len(bridge_factory.calls) == 1
+    assert bridge_factory.calls[0].command[:4] == [desktop.sys.executable, "-m", "parakeet.cli", "bridge"]
+    assert bridge_factory.calls[0].env is not None
+    assert bridge_factory.calls[0].env["PARAKEET_E2E_MODE"] == "1"
+    assert state_requests == ["state:49012:12.0", "state:49012:12.0"]
+    assert action_requests == [f"49012:quit:{desktop.DEFAULT_GUI_E2E_ACTION_TIMEOUT_SECONDS}"]
+    assert (stage_root / "smoke" / "bridge.stdout.log").exists()
+    assert (stage_root / "smoke" / "startup-diagnostics.json").exists()
 
 
 def test_run_gui_package_smoke_command_launches_packaged_app_and_validates_diagnostics(monkeypatch, tmp_path: Path):

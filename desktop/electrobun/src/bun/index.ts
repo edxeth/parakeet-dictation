@@ -35,6 +35,21 @@ type RendererReadyPayload = {
   userAgent: string;
 };
 
+type RendererAutomationSnapshot = {
+  statusBadgeText: string;
+  statusBadgeClassName: string;
+  statusLine: string;
+  toggleButtonText: string;
+  toggleButtonDisabled: boolean;
+  clearHistoryButtonDisabled: boolean;
+  busyOverlayVisible: boolean;
+  bridgeUrl: string;
+  bridgeCommand: string;
+  errorText: string;
+  historyCount: number;
+  historyTexts: string[];
+};
+
 type StartupDiagnostics = {
   bridgeUrl: string;
   hotkey: string;
@@ -85,6 +100,7 @@ type AutomationState = {
     ready: boolean;
     rpcReady: boolean;
     userAgent: string | null;
+    snapshot: RendererAutomationSnapshot | null;
   };
   bridge: BridgeViewState;
   diagnostics: StartupDiagnostics;
@@ -104,7 +120,9 @@ type DesktopRPC = {
     messages: {};
   }>;
   webview: RPCSchema<{
-    requests: {};
+    requests: {
+      getAutomationSnapshot: { params: {}; response: RendererAutomationSnapshot };
+    };
     messages: {};
   }>;
 };
@@ -267,6 +285,18 @@ function isAutomationAction(value: string): value is AutomationActionId {
   ].includes(value);
 }
 
+async function readRendererAutomationSnapshot(): Promise<RendererAutomationSnapshot | null> {
+  if (!startupDiagnostics.rendererRpcReady || !mainWindow?.webview.rpc) {
+    return null;
+  }
+  try {
+    return await mainWindow.webview.rpc.request.getAutomationSnapshot({});
+  } catch (error) {
+    appendGuiLog("WARN", `Failed to read renderer automation snapshot: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
 async function readAutomationState(): Promise<AutomationState> {
   return {
     enabled: GUI_E2E_ENABLED,
@@ -283,6 +313,7 @@ async function readAutomationState(): Promise<AutomationState> {
       ready: startupDiagnostics.rendererReady,
       rpcReady: startupDiagnostics.rendererRpcReady,
       userAgent: startupDiagnostics.rendererUserAgent,
+      snapshot: await readRendererAutomationSnapshot(),
     },
     bridge: await readBridgeState(),
     diagnostics: { ...startupDiagnostics },

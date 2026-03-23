@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -527,6 +528,13 @@ def wait_for_shutdown_reason(path: Path, *, timeout_seconds: float) -> dict[str,
     raise DesktopAppError(f"Packaged Windows app did not update shutdown diagnostics at {path} within {timeout_seconds} seconds.")
 
 
+def reserve_socket_localhost_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        return int(listener.getsockname()[1])
+
+
 def reserve_localhost_port() -> int:
     powershell_path = find_windows_powershell()
     if powershell_path is not None:
@@ -550,16 +558,7 @@ def reserve_localhost_port() -> int:
         )
         return int(output.splitlines()[-1].strip())
 
-    with subprocess.Popen(
-        ["python3", "-c", "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ) as completed:
-        stdout, stderr = completed.communicate()
-        if completed.returncode != 0:
-            raise DesktopAppError(stderr.strip() or "Failed to reserve a localhost port for GUI automation.")
-        return int(stdout.strip())
+    return reserve_socket_localhost_port()
 
 
 def gui_e2e_base_url(port: int) -> str:
@@ -728,6 +727,194 @@ def run_gui_package_automation_command(namespace: Any) -> int:
         return 0
 
     print(f"Packaged Windows desktop app automation check passed with diagnostics at {payload['diagnostics_path']}")
+    print(payload["windows_diagnostics_path"])
+    return 0
+
+
+def run_gui_package_bridge_recovery_command(namespace: Any) -> int:
+    payload = build_windows_package_payload()
+    stage_root = Path(payload["stage_root"])
+    smoke_paths = build_gui_smoke_paths(stage_root)
+    timeout_seconds = float(getattr(namespace, "timeout_seconds", DEFAULT_GUI_SMOKE_TIMEOUT_SECONDS))
+    automation_port = int(getattr(namespace, "automation_port", 0)) or reserve_localhost_port()
+    host = str(getattr(namespace, "host", DEFAULT_BRIDGE_HOST))
+    bridge_port = int(getattr(namespace, "bridge_port", 0)) or reserve_socket_localhost_port()
+    expected_bridge_url = bridge_url(host, bridge_port)
+    expected_bridge_command = bridge_start_command(host, bridge_port)
+    bridge_stdout_path = smoke_paths["smoke_dir"] / "bridge.stdout.log"
+    bridge_stderr_path = smoke_paths["smoke_dir"] / "bridge.stderr.log"
+
+    installed_paths = installed_windows_app_paths(str(payload["app_identifier"]), str(payload["app_channel"]))
+    prepare_installed_windows_app_for_reinstall(installed_paths)
+    clear_existing_gui_startup_logs(installed_paths)
+
+    installer_completed = run_wsl_windows_executable_capture(
+        Path(payload["installer_path"]),
+        timeout_seconds=timeout_seconds,
+    )
+    smoke_paths["installer_stdout_path"].write_text(installer_completed.stdout, encoding="utf-8")
+    smoke_paths["installer_stderr_path"].write_text(installer_completed.stderr, encoding="utf-8")
+    if installer_completed.returncode != 0:
+        raise DesktopAppError(
+            f"Packaged Windows installer exited with code {installer_completed.returncode}. See {smoke_paths['installer_stdout_path']} and {smoke_paths['installer_stderr_path']}."
+        )
+    if not installed_paths["launcher_path"].exists():
+        raise DesktopAppError(f"Installed Windows launcher not found at {installed_paths['launcher_path']}")
+
+    launcher_process = launch_wsl_windows_executable(
+        installed_paths["launcher_path"],
+        env={
+            "PARAKEET_GUI_E2E": "1",
+            "PARAKEET_GUI_E2E_PORT": str(automation_port),
+            "PARAKEET_BRIDGE_URL": expected_bridge_url,
+            "PARAKEET_BRIDGE_COMMAND": expected_bridge_command,
+        },
+    )
+    bridge_process: subprocess.Popen[str] | None = None
+    initial_state: dict[str, Any] | None = None
+    recovered_state: dict[str, Any] | None = None
+    quit_state: dict[str, Any] | None = None
+    diagnostics: dict[str, Any] | None = None
+    try:
+        wait_for_startup_readiness(installed_paths["diagnostics_path"], timeout_seconds=timeout_seconds)
+
+        def _offline_ready(state: dict[str, Any]) -> bool:
+            bridge_state = state.get("bridge")
+            renderer_state = state.get("renderer")
+            snapshot = renderer_state.get("snapshot") if isinstance(renderer_state, dict) else None
+            if not isinstance(bridge_state, dict) or not isinstance(snapshot, dict):
+                return False
+            return (
+                bridge_state.get("connected") is False
+                and snapshot.get("toggleButtonText") == "Bridge offline"
+                and snapshot.get("bridgeUrl") == expected_bridge_url
+                and snapshot.get("bridgeCommand") == expected_bridge_command
+                and "Start the WSL bridge command below" in str(snapshot.get("statusLine", ""))
+            )
+
+        initial_state = wait_for_gui_e2e_state(
+            automation_port,
+            _offline_ready,
+            timeout_seconds=timeout_seconds,
+        )
+
+        bridge_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "parakeet.cli",
+                "bridge",
+                "--host",
+                host,
+                "--port",
+                str(bridge_port),
+            ],
+            cwd=repo_root(),
+            env={
+                **os.environ,
+                "PARAKEET_E2E_MODE": "1",
+                "PARAKEET_E2E_TRANSCRIPT": "offline online recovery transcript",
+                "PARAKEET_E2E_START_DELAY_MS": "30",
+                "PARAKEET_E2E_STOP_DELAY_MS": "40",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if not wait_for_bridge(host, bridge_port, timeout_seconds=10.0):
+            exit_code = bridge_process.poll()
+            raise DesktopAppError(
+                f"Parakeet bridge did not become ready at {expected_bridge_url} within 10 seconds (exit code {exit_code})."
+            )
+
+        def _recovered(state: dict[str, Any]) -> bool:
+            bridge_state = state.get("bridge")
+            renderer_state = state.get("renderer")
+            snapshot = renderer_state.get("snapshot") if isinstance(renderer_state, dict) else None
+            if not isinstance(bridge_state, dict) or not isinstance(snapshot, dict):
+                return False
+            return (
+                bridge_state.get("connected") is True
+                and snapshot.get("bridgeUrl") == expected_bridge_url
+                and snapshot.get("toggleButtonText") in {"Start recording", "Load + record"}
+                and "Model ready. Press the button or the hotkey to begin." in str(snapshot.get("statusLine", ""))
+            )
+
+        recovered_state = wait_for_gui_e2e_state(
+            automation_port,
+            _recovered,
+            timeout_seconds=timeout_seconds,
+        )
+        quit_state = invoke_gui_e2e_action(automation_port, "quit")
+        launcher_process.wait(timeout=10)
+        diagnostics = wait_for_shutdown_reason(installed_paths["diagnostics_path"], timeout_seconds=10.0)
+    finally:
+        if bridge_process is not None:
+            _stop_process(bridge_process)
+        if launcher_process.poll() is None:
+            try:
+                launcher_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                launcher_process.terminate()
+                try:
+                    launcher_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    launcher_process.kill()
+                    launcher_process.wait(timeout=5)
+
+    launcher_stdout, launcher_stderr = launcher_process.communicate()
+    smoke_paths["launcher_stdout_path"].write_text(launcher_stdout, encoding="utf-8")
+    smoke_paths["launcher_stderr_path"].write_text(launcher_stderr, encoding="utf-8")
+
+    bridge_stdout = ""
+    bridge_stderr = ""
+    bridge_exit_code: int | None = None
+    if bridge_process is not None:
+        bridge_stdout, bridge_stderr = bridge_process.communicate()
+        bridge_exit_code = bridge_process.returncode
+    bridge_stdout_path.write_text(bridge_stdout, encoding="utf-8")
+    bridge_stderr_path.write_text(bridge_stderr, encoding="utf-8")
+
+    if installed_paths["log_path"].exists():
+        shutil.copy2(installed_paths["log_path"], smoke_paths["log_path"])
+    if installed_paths["diagnostics_path"].exists():
+        shutil.copy2(installed_paths["diagnostics_path"], smoke_paths["diagnostics_path"])
+
+    payload.update(
+        {
+            "smoke_dir": str(smoke_paths["smoke_dir"]),
+            "windows_smoke_dir": windows_path_from_wsl(smoke_paths["smoke_dir"]),
+            "diagnostics_path": str(smoke_paths["diagnostics_path"]),
+            "windows_diagnostics_path": windows_path_from_wsl(smoke_paths["diagnostics_path"]),
+            "log_path": str(smoke_paths["log_path"]),
+            "windows_log_path": windows_path_from_wsl(smoke_paths["log_path"]),
+            "installer_stdout_path": str(smoke_paths["installer_stdout_path"]),
+            "installer_stderr_path": str(smoke_paths["installer_stderr_path"]),
+            "launcher_stdout_path": str(smoke_paths["launcher_stdout_path"]),
+            "launcher_stderr_path": str(smoke_paths["launcher_stderr_path"]),
+            "bridge_stdout_path": str(bridge_stdout_path),
+            "bridge_stderr_path": str(bridge_stderr_path),
+            "installed_launcher_path": str(installed_paths["launcher_path"]),
+            "windows_installed_launcher_path": windows_path_from_wsl(installed_paths["launcher_path"]),
+            "launcher_exit_code": launcher_process.returncode,
+            "bridge_exit_code": bridge_exit_code,
+            "automation_port": automation_port,
+            "bridge_host": host,
+            "bridge_port": bridge_port,
+            "bridge_url": expected_bridge_url,
+            "bridge_command": expected_bridge_command,
+            "initial_state": initial_state,
+            "recovered_state": recovered_state,
+            "quit_state": quit_state,
+            "startup_diagnostics": diagnostics,
+        }
+    )
+
+    if bool(getattr(namespace, "json_output", False)):
+        print(json.dumps(payload))
+        return 0
+
+    print(f"Packaged Windows desktop bridge recovery check passed with diagnostics at {payload['diagnostics_path']}")
     print(payload["windows_diagnostics_path"])
     return 0
 

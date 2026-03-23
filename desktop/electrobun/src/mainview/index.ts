@@ -36,6 +36,21 @@ type BridgeViewState = {
   session: SessionPayload;
 };
 
+type RendererAutomationSnapshot = {
+  statusBadgeText: string;
+  statusBadgeClassName: string;
+  statusLine: string;
+  toggleButtonText: string;
+  toggleButtonDisabled: boolean;
+  clearHistoryButtonDisabled: boolean;
+  busyOverlayVisible: boolean;
+  bridgeUrl: string;
+  bridgeCommand: string;
+  errorText: string;
+  historyCount: number;
+  historyTexts: string[];
+};
+
 type DesktopRPC = {
   bun: {
     requests: {
@@ -50,7 +65,9 @@ type DesktopRPC = {
     messages: {};
   };
   webview: {
-    requests: {};
+    requests: {
+      getAutomationSnapshot: { params: {}; response: RendererAutomationSnapshot };
+    };
     messages: {};
   };
 };
@@ -58,7 +75,9 @@ type DesktopRPC = {
 const rpc = Electroview.defineRPC<DesktopRPC>({
   maxRequestTime: 30000,
   handlers: {
-    requests: {},
+    requests: {
+      getAutomationSnapshot: async () => buildRendererAutomationSnapshot(currentState),
+    },
     messages: {},
   },
 });
@@ -230,6 +249,24 @@ function getFilteredHistory(viewState: BridgeViewState | null): TranscriptHistor
   return (viewState.session.history || []).filter((item) => {
     return historyClearedAfter === null || item.completed_at > historyClearedAfter;
   });
+}
+
+function buildRendererAutomationSnapshot(viewState: BridgeViewState | null): RendererAutomationSnapshot {
+  const filteredHistory = getFilteredHistory(viewState);
+  return {
+    statusBadgeText: statusBadge.textContent?.trim() || "",
+    statusBadgeClassName: statusBadge.className,
+    statusLine: statusLine.textContent?.trim() || "",
+    toggleButtonText: toggleButton.textContent?.trim() || "",
+    toggleButtonDisabled: toggleButton.disabled,
+    clearHistoryButtonDisabled: clearHistoryButton.disabled,
+    busyOverlayVisible: !busyOverlay.classList.contains("hidden"),
+    bridgeUrl: bridgeUrl.textContent?.trim() || (viewState?.bridgeUrl ?? ""),
+    bridgeCommand: bridgeCommand.textContent?.trim() || (viewState?.bridgeStartCommand ?? ""),
+    errorText: errorBox.textContent?.trim() || "",
+    historyCount: filteredHistory.length,
+    historyTexts: filteredHistory.map((item) => item.payload.transcript || ""),
+  };
 }
 
 function renderEmptyHistory() {

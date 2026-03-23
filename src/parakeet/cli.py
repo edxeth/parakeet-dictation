@@ -258,6 +258,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gui_package_automation_parser.set_defaults(handler=_run_gui_package_automation_namespace)
 
+    gui_package_bridge_recovery_parser = subparsers.add_parser(
+        "gui-package-bridge-recovery",
+        help="Package the Windows app and verify offline-to-online bridge recovery.",
+        description="Package the Windows app and verify offline-to-online bridge recovery.",
+    )
+    gui_package_bridge_recovery_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit machine-readable JSON.",
+    )
+    gui_package_bridge_recovery_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Maximum seconds to wait for the packaged Windows verification flow.",
+    )
+    gui_package_bridge_recovery_parser.add_argument(
+        "--automation-port",
+        type=int,
+        default=0,
+        help="Optional localhost port for the packaged GUI automation server.",
+    )
+    gui_package_bridge_recovery_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface the deterministic WSL bridge should bind to during verification.",
+    )
+    gui_package_bridge_recovery_parser.add_argument(
+        "--bridge-port",
+        type=int,
+        default=0,
+        help="Optional localhost port for the deterministic WSL bridge during verification.",
+    )
+    gui_package_bridge_recovery_parser.set_defaults(handler=_run_gui_package_bridge_recovery_namespace)
+
     full_parser = subparsers.add_parser(
         "full",
         help="Start the bridge and desktop GUI together.",
@@ -347,6 +383,12 @@ def _run_gui_package_automation_namespace(namespace: argparse.Namespace) -> int:
     from parakeet.desktop import run_gui_package_automation_command
 
     return run_gui_package_automation_command(namespace)
+
+
+def _run_gui_package_bridge_recovery_namespace(namespace: argparse.Namespace) -> int:
+    from parakeet.desktop import run_gui_package_bridge_recovery_command
+
+    return run_gui_package_bridge_recovery_command(namespace)
 
 
 def _run_full_namespace(namespace: argparse.Namespace) -> int:
