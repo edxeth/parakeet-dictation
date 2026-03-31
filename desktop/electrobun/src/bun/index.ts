@@ -143,7 +143,29 @@ type DesktopRPC = {
 };
 
 const BRIDGE_URL = Bun.env.PARAKEET_BRIDGE_URL || "http://127.0.0.1:8765";
-const HOTKEY = Bun.env.PARAKEET_HOTKEY || "CommandOrControl+Alt+R";
+const IS_LINUX_WAYLAND = process.platform === "linux"
+  && ((Bun.env.XDG_SESSION_TYPE || "").toLowerCase() === "wayland" || Boolean(Bun.env.WAYLAND_DISPLAY));
+const DEFAULT_HOTKEY = process.platform === "linux" ? "Control+Alt+R" : "CommandOrControl+Alt+R";
+
+function normalizeHotkey(accelerator: string): string {
+  return accelerator
+    .split("+")
+    .map((part) => {
+      const trimmed = part.trim();
+      const normalized = trimmed.toLowerCase();
+      if (normalized === "ctrl") {
+        return "Control";
+      }
+      if (process.platform === "linux" && (normalized === "commandorcontrol" || normalized === "cmdorctrl")) {
+        return "Control";
+      }
+      return trimmed;
+    })
+    .filter(Boolean)
+    .join("+");
+}
+
+const HOTKEY = normalizeHotkey(Bun.env.PARAKEET_HOTKEY || DEFAULT_HOTKEY);
 const BRIDGE_START_COMMAND = Bun.env.PARAKEET_BRIDGE_COMMAND || "parakeet bridge --host 127.0.0.1 --port 8765";
 const GUI_E2E_ENABLED = Bun.env.PARAKEET_GUI_E2E === "1";
 const GUI_E2E_PORT = Number(Bun.env.PARAKEET_GUI_E2E_PORT || "0") || 0;
@@ -823,17 +845,26 @@ tray.on("tray-clicked", async (event: any) => {
 });
 
 appendGuiLog("INFO", "Registering global hotkey...");
-const registeredHotkey = GlobalShortcut.register(HOTKEY, () => {
-  void triggerHotkeyCallback();
-});
-updateStartupDiagnostics({
-  hotkeyRegistered: registeredHotkey,
-  hotkeyRegisteredAt: timestamp(),
-});
-if (!registeredHotkey) {
-  appendGuiLog("WARN", `Failed to register global hotkey: ${HOTKEY}`);
+let registeredHotkey = false;
+if (IS_LINUX_WAYLAND) {
+  updateStartupDiagnostics({
+    hotkeyRegistered: false,
+    hotkeyRegisteredAt: null,
+  });
+  appendGuiLog("WARN", `Skipping global hotkey registration on Linux Wayland: ${HOTKEY}`);
 } else {
-  appendGuiLog("INFO", `Global hotkey registered: ${HOTKEY}`);
+  registeredHotkey = GlobalShortcut.register(HOTKEY, () => {
+    void triggerHotkeyCallback();
+  });
+  updateStartupDiagnostics({
+    hotkeyRegistered: registeredHotkey,
+    hotkeyRegisteredAt: registeredHotkey ? timestamp() : null,
+  });
+  if (!registeredHotkey) {
+    appendGuiLog("WARN", `Failed to register global hotkey: ${HOTKEY}`);
+  } else {
+    appendGuiLog("INFO", `Global hotkey registered: ${HOTKEY}`);
+  }
 }
 
 startBridgePolling();

@@ -111,6 +111,7 @@ Subcommands:
 - `parakeet doctor`
 - `parakeet benchmark`
 - `parakeet bridge`
+- `parakeet bridge-toggle`
 - `parakeet gui`
 - `parakeet gui-stage`
 - `parakeet gui-package`
@@ -266,6 +267,7 @@ Desktop behavior:
 - the app can clear the visible transcript history
 - the app plays a short sound when recording starts and another when recording stops
 - default hotkey is `Ctrl` + `Alt` + `R`
+- native global hotkeys are not available in Wayland sessions with the current Electrobun backend; use your compositor to bind `parakeet bridge-toggle` instead
 - override bridge URL, bridge command, or hotkey with `PARAKEET_BRIDGE_URL`, `PARAKEET_BRIDGE_COMMAND`, and `PARAKEET_HOTKEY`
 
 ## Benchmark

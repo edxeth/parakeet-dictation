@@ -76,6 +76,23 @@ def test_gui_subcommand_dispatches_to_desktop_runner(monkeypatch):
     assert calls[0].hotkey == "Super+R"
 
 
+def test_bridge_toggle_subcommand_dispatches_to_desktop_runner(monkeypatch):
+    calls: list[SimpleNamespace] = []
+
+    def _fake_bridge_toggle(namespace):
+        calls.append(namespace)
+        return 0
+
+    monkeypatch.setattr("parakeet.desktop.run_bridge_toggle_command", _fake_bridge_toggle)
+
+    assert main(["bridge-toggle", "--host", "127.0.0.1", "--port", "8765", "--json"]) == 0
+    assert len(calls) == 1
+    assert calls[0].command == "bridge-toggle"
+    assert calls[0].host == "127.0.0.1"
+    assert calls[0].port == 8765
+    assert calls[0].json_output is True
+
+
 def test_gui_stage_subcommand_dispatches_to_desktop_stager(monkeypatch):
     calls: list[SimpleNamespace] = []
 
@@ -288,6 +305,39 @@ def test_build_gui_environment_sets_native_log_paths(monkeypatch, tmp_path: Path
     assert env["PARAKEET_HOTKEY"] == "Super+R"
     assert env["PARAKEET_GUI_LOG_PATH"].endswith(".local/state/parakeet/desktop/startup.log")
     assert env["PARAKEET_GUI_STARTUP_DIAGNOSTICS_PATH"].endswith(".local/state/parakeet/desktop/startup-diagnostics.json")
+
+
+def test_run_bridge_toggle_command_posts_to_bridge(monkeypatch, capsys):
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"state":"recording"}'
+
+    def _fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = request.data
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(desktop, "urlopen", _fake_urlopen)
+
+    namespace = SimpleNamespace(host="127.0.0.1", port=8765, json_output=False)
+    assert desktop.run_bridge_toggle_command(namespace) == 0
+    assert captured == {
+        "url": "http://127.0.0.1:8765/session/toggle",
+        "method": "POST",
+        "body": b"{}",
+        "timeout": 5.0,
+    }
+    assert capsys.readouterr().out.strip() == "recording"
 
 
 def test_run_gui_command_launches_native_electrobun_app(monkeypatch, tmp_path: Path):

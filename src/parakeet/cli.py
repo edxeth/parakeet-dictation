@@ -168,6 +168,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_bridge_cli_arguments(bridge_parser)
     bridge_parser.set_defaults(handler=_run_bridge_namespace)
 
+    bridge_toggle_parser = subparsers.add_parser(
+        "bridge-toggle",
+        help="Toggle the current bridge recording session over localhost.",
+        description="Toggle the current bridge recording session over localhost.",
+    )
+    bridge_toggle_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bridge host the toggle command should connect to.",
+    )
+    bridge_toggle_parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Bridge port the toggle command should connect to.",
+    )
+    bridge_toggle_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit machine-readable JSON.",
+    )
+    bridge_toggle_parser.set_defaults(handler=_run_bridge_toggle_namespace)
+
     gui_parser = subparsers.add_parser(
         "gui",
         help="Run the Electrobun desktop app on the current platform.",
@@ -493,6 +517,12 @@ def _run_gui_namespace(namespace: argparse.Namespace) -> int:
     from parakeet.desktop import run_gui_command
 
     return run_gui_command(namespace)
+
+
+def _run_bridge_toggle_namespace(namespace: argparse.Namespace) -> int:
+    from parakeet.desktop import run_bridge_toggle_command
+
+    return run_bridge_toggle_command(namespace)
 
 
 def _run_gui_stage_namespace(namespace: argparse.Namespace) -> int:

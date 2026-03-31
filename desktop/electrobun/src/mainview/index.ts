@@ -470,7 +470,9 @@ function renderState(viewState: BridgeViewState) {
 
   if (!viewState.connected) {
     toggleButton.textContent = "Bridge offline";
-    statusLine.textContent = "Start the bridge command below, then use the button or hotkey.";
+    statusLine.textContent = viewState.hotkeyRegistered
+      ? "Start the bridge command below, then use the button or hotkey."
+      : "Start the bridge command below, then use the button. Global hotkey unavailable in this session.";
   } else if (viewState.session.model_loading) {
     toggleButton.textContent = "Loading model…";
     statusLine.textContent = "Bridge is warming the model. Recording will unlock automatically when ready.";
@@ -489,8 +491,12 @@ function renderState(viewState: BridgeViewState) {
   } else {
     toggleButton.textContent = viewState.session.model_loaded ? "Start recording" : "Load + record";
     statusLine.textContent = viewState.session.model_loaded
-      ? "Model ready. Press the button or the hotkey to begin."
-      : "Ready. First recording will load the model; after that it stays warm.";
+      ? viewState.hotkeyRegistered
+        ? "Model ready. Press the button or the hotkey to begin."
+        : "Model ready. Press the button to begin. Global hotkey unavailable in this session."
+      : viewState.hotkeyRegistered
+        ? "Ready. First recording will load the model; after that it stays warm."
+        : "Ready. First recording will load the model; after that it stays warm. Global hotkey unavailable in this session.";
   }
 
   const errorLines = [];

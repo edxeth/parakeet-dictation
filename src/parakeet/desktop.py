@@ -236,6 +236,34 @@ def wait_for_bridge(host: str, port: int, *, timeout_seconds: float = 10.0, poll
     return False
 
 
+def run_bridge_toggle_command(namespace: Any) -> int:
+    host = str(getattr(namespace, "host", DEFAULT_BRIDGE_HOST))
+    port = int(getattr(namespace, "port", DEFAULT_BRIDGE_PORT))
+    request = Request(
+        f"{bridge_url(host, port)}/session/toggle",
+        data=b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=5.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace").strip()
+        raise DesktopAppError(detail or f"Bridge toggle request failed: {error.code}") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise DesktopAppError(f"Bridge toggle request failed: {error}") from error
+
+    if not isinstance(payload, dict):
+        raise DesktopAppError("Bridge toggle response was not a JSON object.")
+
+    if bool(getattr(namespace, "json_output", False)):
+        print(json.dumps(payload))
+    else:
+        print(str(payload.get("state", "ok")))
+    return 0
+
+
 def build_bridge_command(namespace: Any) -> list[str]:
     host = str(getattr(namespace, "host", DEFAULT_BRIDGE_HOST))
     port = int(getattr(namespace, "port", DEFAULT_BRIDGE_PORT))

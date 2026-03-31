@@ -70,12 +70,15 @@ This stages `desktop/electrobun/` to `%LOCALAPPDATA%\ParakeetDictation\staging\.
 
 - `PARAKEET_BRIDGE_URL` — default `http://127.0.0.1:8765`
 - `PARAKEET_BRIDGE_COMMAND` — command shown in the UI as the bridge startup command
-- `PARAKEET_HOTKEY` — default `CommandOrControl+Alt+R`
+- `PARAKEET_HOTKEY` — default `Control+Alt+R` on Linux, `CommandOrControl+Alt+R` on Windows
+- native Linux global hotkeys are for X11 sessions; on Wayland, use your compositor to bind `parakeet bridge-toggle`
 
 Example:
 
 ```bash
-PARAKEET_HOTKEY="CommandOrControl+Alt+R" bun run start
+PARAKEET_HOTKEY="Control+Alt+R" bun run start
+# Wayland compositor workaround example:
+parakeet bridge-toggle --host 127.0.0.1 --port 8765
 ```
 
 ## Verify the app scaffold
