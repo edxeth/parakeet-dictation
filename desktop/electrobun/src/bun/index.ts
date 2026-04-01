@@ -422,7 +422,6 @@ async function readBridgeState(): Promise<BridgeViewState> {
   }
 }
 
-const BRIDGE_POLL_INTERVAL_MS = 120;
 const HOTKEY_COOLDOWN_MS = 450;
 
 let lastObservedSessionState: SessionPayload["state"] | "offline" = "offline";
@@ -508,10 +507,8 @@ function applyObservedBridgeState(state: BridgeViewState, { allowCue = true }: {
   lastObservedSessionState = nextSessionState;
 }
 
-async function refreshBridgeStateCache({ allowCue = true }: { allowCue?: boolean } = {}) {
-  const state = await readBridgeState();
-  applyObservedBridgeState(state, { allowCue });
-  return state;
+async function refreshBridgeStateCache() {
+  return await readBridgeState();
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -586,7 +583,6 @@ let mainWindow: BrowserWindow<any> | null = null;
 let tray: Tray | null = null;
 let autoExitTimer: ReturnType<typeof setTimeout> | null = null;
 let automationServer: ReturnType<typeof Bun.serve> | null = null;
-let bridgePollTimer: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
 let sessionToggleInFlight = false;
 let lastHotkeyInvocationAt = 0;
@@ -606,10 +602,6 @@ function exitApp(reason: string, exitCode = 0) {
   });
   appendGuiLog("INFO", `Shutting down app: ${reason}`);
   automationServer?.stop(true);
-  if (bridgePollTimer) {
-    clearInterval(bridgePollTimer);
-    bridgePollTimer = null;
-  }
   GlobalShortcut.unregisterAll();
   tray?.remove();
   process.exit(exitCode);
@@ -623,20 +615,6 @@ function scheduleAutoExit() {
   autoExitTimer = setTimeout(() => {
     exitApp("e2e-auto-exit");
   }, GUI_AUTO_EXIT_MS);
-}
-
-function startBridgePolling() {
-  if (bridgePollTimer) {
-    return;
-  }
-  void refreshBridgeStateCache().catch((error) => {
-    appendGuiLog("WARN", `Initial bridge poll failed: ${error instanceof Error ? error.message : String(error)}`);
-  });
-  bridgePollTimer = setInterval(() => {
-    void refreshBridgeStateCache().catch((error) => {
-      appendGuiLog("WARN", `Bridge poll failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  }, BRIDGE_POLL_INTERVAL_MS);
 }
 
 process.on("uncaughtException", (error) => {
@@ -687,7 +665,7 @@ mainWindow = new BrowserWindow({
         },
         toggleBackend: async () => {
           toggleBackendAndRestartBridge();
-          return await refreshBridgeStateCache({ allowCue: false });
+          return await refreshBridgeStateCache();
         },
         clearHistory: async () => {
           await fetchBridgeJson("/session/clear-history", { method: "POST", body: "{}" });
@@ -951,7 +929,6 @@ if (IS_LINUX_WAYLAND) {
   }
 }
 
-startBridgePolling();
 startAutomationServer();
 
 appendGuiLog("INFO", "Local AI Dictation desktop app started");

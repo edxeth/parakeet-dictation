@@ -42,6 +42,19 @@ type BridgeViewState = {
   session: SessionPayload;
 };
 
+type BridgeHealthPayload = {
+  schema_version: number;
+  ok: boolean;
+  bridge: {
+    backend: string;
+    model_backend: BackendName;
+    model_loaded: boolean;
+    model_loading: boolean;
+    e2e_mode: boolean;
+  };
+  session: SessionPayload;
+};
+
 type SessionStatus = SessionPayload["state"] | "offline";
 
 type RendererAutomationSnapshot = {
@@ -148,6 +161,11 @@ let historyClearedAfter: number | null = null;
 const copiedHistoryIds = new Set<string>();
 const copiedHistoryTimers = new Map<string, number>();
 let sessionAudioContext: AudioContext | null = null;
+let bridgeEventSource: EventSource | null = null;
+const APP_STARTED_AT = Date.now() / 1000;
+let lastObservedSessionState: SessionStatus = "offline";
+let lastPlayedStartCueAt: number | null = null;
+let lastPlayedCompleteCueAt: number | null = null;
 const sessionCueAudio: Record<SessionCueKind, HTMLAudioElement> = {
   start: new Audio("assets/session-start.wav"),
   complete: new Audio("assets/session-complete.wav"),
@@ -393,6 +411,81 @@ function buildStateSignature(viewState: BridgeViewState): string {
   });
 }
 
+
+function normalizeBackendName(value: unknown): BackendName {
+  return value === "parakeet" ? "parakeet" : "whisper";
+}
+
+function buildViewStateFromHealthPayload(payload: BridgeHealthPayload): BridgeViewState {
+  return {
+    bridgeUrl: currentState?.bridgeUrl ?? "",
+    bridgeStartCommand: currentState?.bridgeStartCommand ?? "",
+    preferredBackend: normalizeBackendName(payload.bridge?.model_backend ?? currentState?.preferredBackend),
+    hotkey: currentState?.hotkey ?? "Ctrl+Alt+R",
+    hotkeyRegistered: currentState?.hotkeyRegistered ?? false,
+    connected: true,
+    session: payload.session,
+  };
+}
+
+function applyObservedBridgeState(viewState: BridgeViewState, { allowCue = true }: { allowCue?: boolean } = {}) {
+  const nextSessionState: SessionStatus = viewState.connected ? viewState.session.state : "offline";
+  const nextStartCueAt = viewState.connected
+    ? (typeof viewState.session.recording_started_at === "number" ? viewState.session.recording_started_at : viewState.session.started_at)
+    : null;
+  const nextCompleteCueAt = viewState.connected
+    ? (typeof viewState.session.clipboard_copied_at === "number" ? viewState.session.clipboard_copied_at : viewState.session.last_completed_at)
+    : null;
+
+  if (allowCue) {
+    if (nextSessionState === "recording" && nextStartCueAt !== null && nextStartCueAt >= APP_STARTED_AT && nextStartCueAt !== lastPlayedStartCueAt) {
+      lastPlayedStartCueAt = nextStartCueAt;
+      playSessionCue("start");
+    }
+
+    if (nextCompleteCueAt !== null && nextCompleteCueAt >= APP_STARTED_AT && nextCompleteCueAt !== lastPlayedCompleteCueAt) {
+      lastPlayedCompleteCueAt = nextCompleteCueAt;
+      playSessionCue("complete");
+    }
+  }
+
+  lastObservedSessionState = nextSessionState;
+}
+
+function applyBridgeViewState(viewState: BridgeViewState, { allowCue = true }: { allowCue?: boolean } = {}) {
+  applyObservedBridgeState(viewState, { allowCue });
+  const nextSignature = buildStateSignature(viewState);
+  if (nextSignature !== lastRenderedStateSignature) {
+    renderState(viewState);
+    lastRenderedStateSignature = nextSignature;
+  } else {
+    currentState = viewState;
+  }
+}
+
+function connectBridgeEvents() {
+  const nextUrl = currentState?.bridgeUrl;
+  if (!nextUrl || bridgeEventSource) {
+    return;
+  }
+
+  bridgeEventSource = new EventSource(`${nextUrl}/events`);
+  bridgeEventSource.addEventListener("session", (event) => {
+    try {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as BridgeHealthPayload;
+      applyBridgeViewState(buildViewStateFromHealthPayload(payload));
+    } catch (error) {
+      errorBox.textContent = error instanceof Error ? error.message : String(error);
+    }
+  });
+  bridgeEventSource.onerror = () => {
+    if (bridgeEventSource?.readyState === EventSource.CLOSED) {
+      bridgeEventSource.close();
+      bridgeEventSource = null;
+    }
+  };
+}
+
 function renderEmptyHistory() {
   historyMeta.textContent = "Logbook empty";
   historyList.innerHTML = `
@@ -531,13 +624,7 @@ async function refreshState({ quiet = false }: { quiet?: boolean } = {}) {
   }
   try {
     const state = await electrobun.rpc!.request.getBridgeState({});
-    const nextSignature = buildStateSignature(state);
-    if (nextSignature !== lastRenderedStateSignature) {
-      renderState(state);
-      lastRenderedStateSignature = nextSignature;
-    } else {
-      currentState = state;
-    }
+    applyBridgeViewState(state);
   } finally {
     if (!quiet) {
       setBusy(false);
@@ -552,8 +639,7 @@ async function toggleRecording() {
     const next = current.connected && ["starting", "recording"].includes(current.session.state)
       ? await electrobun.rpc!.request.stopRecording({})
       : await electrobun.rpc!.request.startRecording({});
-    renderState(next);
-    lastRenderedStateSignature = buildStateSignature(next);
+    applyBridgeViewState(next);
   } catch (error) {
     errorBox.textContent = error instanceof Error ? error.message : String(error);
   } finally {
@@ -565,8 +651,7 @@ async function toggleModel() {
   setBusy(true);
   try {
     const next = await electrobun.rpc!.request.toggleBackend({});
-    renderState(next);
-    lastRenderedStateSignature = buildStateSignature(next);
+    applyBridgeViewState(next, { allowCue: false });
   } catch (error) {
     errorBox.textContent = error instanceof Error ? error.message : String(error);
   } finally {
@@ -585,9 +670,7 @@ async function clearHistory() {
     historyClearedAfter = Date.now() / 1000;
     const next = await electrobun.rpc!.request.clearHistory({});
     visibleHistoryCount = 10;
-    renderState(next);
-    lastRenderedStateSignature = buildStateSignature(next);
-    await refreshState();
+    applyBridgeViewState(next, { allowCue: false });
   } catch (error) {
     errorBox.textContent = error instanceof Error ? error.message : String(error);
   } finally {
@@ -650,9 +733,7 @@ async function bootstrap() {
       userAgent: navigator.userAgent,
     });
     await refreshState();
-    setInterval(() => {
-      void refreshState({ quiet: true });
-    }, 1000);
+    connectBridgeEvents();
   } catch (error) {
     errorBox.textContent = error instanceof Error ? error.message : String(error);
   }

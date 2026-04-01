@@ -108,6 +108,7 @@ The GUI shows:
 - model switch button
 
 Switching models from the GUI restarts the bridge live.
+The desktop GUI now subscribes to the bridge `/events` SSE stream for live state updates instead of polling bridge state on a timer.
 
 ## Hyprland / Waybar
 
@@ -121,6 +122,8 @@ Behavior:
 - **left click** Waybar icon: start / stop recording
 - **right click** Waybar icon: switch model and restart bridge
 - Waybar shows: `󰍬 Whisper` or `󰍬 Parakeet`
+- Waybar no longer polls bridge state on an interval. The bridge pushes `RTMIN+8` to Waybar on state changes, and the module refreshes on startup and on that signal.
+- The bridge still keeps `/health` for one-shot checks and recovery paths.
 
 Hyprland startup currently launches the bridge with:
 
@@ -130,7 +133,7 @@ exec-once = /home/devkit/.local/bin/local-ai-dictation-bridge &
 
 ## Notes
 
-- On Wayland, the app may say the native global hotkey is unavailable; your compositor hotkey can still work.
+- On Linux Wayland, the desktop app still does **not** own a true global app hotkey yet. `Ctrl+Alt+R` works when the Local AI Dictation window is focused, but a compositor-level shortcut is still needed for truly global activation until GlobalShortcuts portal support is added.
 - Switching backend clears the old model from VRAM by restarting the bridge process.
 - Whisper is the safer backend on 6 GB cards.
 - Parakeet currently has a larger load-time VRAM spike before settling.
@@ -139,5 +142,6 @@ exec-once = /home/devkit/.local/bin/local-ai-dictation-bridge &
 
 ```bash
 python -m compileall src tests
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q tests/test_bridge.py
+cd desktop/electrobun && bun run check
 ```

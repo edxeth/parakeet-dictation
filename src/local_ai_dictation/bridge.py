@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -33,6 +34,26 @@ BRIDGE_SCHEMA_VERSION = 1
 DEFAULT_E2E_TRANSCRIPT = "Local AI Dictation deterministic E2E transcript"
 LAST_CAPTURE_RAW_PATH = Path("/tmp/local-ai-dictation-last-capture-raw.wav")
 LAST_CAPTURE_MODEL_INPUT_PATH = Path("/tmp/local-ai-dictation-last-capture-16k.wav")
+
+
+def _build_status_notifier(env: Mapping[str, str]) -> Callable[[], None] | None:
+    raw_signal = str(env.get("LOCAL_AI_DICTATION_WAYBAR_SIGNAL", "")).strip()
+    if not raw_signal:
+        return None
+    if not raw_signal.isdigit():
+        return None
+
+    process_name = str(env.get("LOCAL_AI_DICTATION_WAYBAR_PROCESS", "waybar")).strip() or "waybar"
+
+    def _notify() -> None:
+        subprocess.run(
+            ["pkill", f"-RTMIN+{raw_signal}", process_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    return _notify
 
 
 class BridgeStateError(RuntimeError):
@@ -81,6 +102,7 @@ class DictationBridgeController:
         e2e_transcript: str = DEFAULT_E2E_TRANSCRIPT,
         e2e_start_delay_ms: int = 0,
         e2e_stop_delay_ms: int = 0,
+        status_notifier: Callable[[], None] | None = None,
         runtime_loader: Callable[..., tuple[Any, Any, Any, Any]] = _load_runtime_dependencies,
         model_loader: Callable[..., tuple[Any, bool, float, float]] = _load_model,
         recorder: Callable[..., bytes | None] = record_audio_interruptible,
@@ -102,12 +124,15 @@ class DictationBridgeController:
         self._e2e_transcript = e2e_transcript
         self._e2e_start_delay_ms = max(0, e2e_start_delay_ms)
         self._e2e_stop_delay_ms = max(0, e2e_stop_delay_ms)
+        self._status_notifier = status_notifier
         self._runtime_loader = runtime_loader
         self._model_loader = model_loader
         self._recorder = recorder
         self._transcriber = transcriber
 
         self._lock = threading.RLock()
+        self._event_condition = threading.Condition(self._lock)
+        self._event_version = 0
         self._runtime_ready = threading.Event()
         self._session_finished = threading.Event()
         self._stop_requested = threading.Event()
@@ -136,8 +161,20 @@ class DictationBridgeController:
         if self._e2e_mode:
             self._append_diagnostic("Deterministic E2E bridge mode enabled")
 
+    def _notify_status(self) -> None:
+        with self._lock:
+            self._event_version += 1
+            self._event_condition.notify_all()
+        if self._status_notifier is None:
+            return
+        try:
+            self._status_notifier()
+        except Exception:
+            return
+
     def _append_diagnostic(self, text: str) -> None:
         should_echo = False
+        should_notify = False
         with self._lock:
             if not text:
                 return
@@ -151,8 +188,11 @@ class DictationBridgeController:
                 self._recording_started_at = time.time()
                 if self._state == "starting":
                     self._state = "recording"
+                    should_notify = True
         if should_echo:
             print(text, file=sys.stdout, flush=True)
+        if should_notify:
+            self._notify_status()
 
     def _config(self) -> DictationConfig:
         return DictationConfig(
@@ -198,6 +238,7 @@ class DictationBridgeController:
         )
         self._model = model
         self._model_loaded = True
+        self._notify_status()
 
     def _warmup_worker(self) -> None:
         warmup_temp_path: str | None = None
@@ -231,6 +272,7 @@ class DictationBridgeController:
                     pass
             with self._lock:
                 self._model_loading = False
+            self._notify_status()
 
     def start_model_warmup(self) -> None:
         with self._lock:
@@ -240,6 +282,7 @@ class DictationBridgeController:
             self._last_error = None
             self._warmup_thread = threading.Thread(target=self._warmup_worker, daemon=True)
             self._warmup_thread.start()
+        self._notify_status()
 
     def _complete_session(self, transcription: TranscriptionResult) -> None:
         payload = json.loads(render_transcription(transcription, "json"))
@@ -256,14 +299,19 @@ class DictationBridgeController:
             self._state = "idle"
             self._started_at = None
             self._history.append(history_item)
+        self._notify_status()
 
     def _complete_cancelled_before_recording(self) -> None:
+        should_notify = False
         with self._lock:
             if self._last_transcript and self._last_transcript.get("metadata", {}).get("cancelled_before_recording"):
                 self._state = "idle"
                 self._started_at = None
                 self._last_error = None
-                return
+                should_notify = True
+        if should_notify:
+            self._notify_status()
+            return
         self._complete_session(
             TranscriptionResult(
                 text="",
@@ -300,6 +348,7 @@ class DictationBridgeController:
         self._append_diagnostic("🎤 Recording...")
         with self._lock:
             self._state = "recording"
+        self._notify_status()
 
         while not self._stop_requested.is_set() and not self._shutdown_requested.is_set():
             time.sleep(0.01)
@@ -308,10 +357,12 @@ class DictationBridgeController:
             with self._lock:
                 self._state = "stopped"
                 self._started_at = None
+            self._notify_status()
             return
 
         with self._lock:
             self._state = "transcribing"
+        self._notify_status()
         self._append_diagnostic("🤖 Generating...")
 
         if not self._wait_for_e2e_delay(self._e2e_stop_delay_ms):
@@ -319,6 +370,7 @@ class DictationBridgeController:
                 with self._lock:
                     self._state = "stopped"
                     self._started_at = None
+                self._notify_status()
                 return
 
         if self.clipboard:
@@ -353,6 +405,7 @@ class DictationBridgeController:
 
             with self._lock:
                 self._state = "recording"
+            self._notify_status()
 
             if self._pyaudio_module is None:
                 raise RuntimeError("PyAudio runtime is unavailable")
@@ -370,6 +423,7 @@ class DictationBridgeController:
                 with self._lock:
                     self._state = "stopped"
                     self._started_at = None
+                self._notify_status()
                 return
 
             if not audio_data:
@@ -381,6 +435,7 @@ class DictationBridgeController:
 
             with self._lock:
                 self._state = "transcribing"
+            self._notify_status()
 
             if self._model is None:
                 raise RuntimeError("Model is not loaded")
@@ -405,11 +460,13 @@ class DictationBridgeController:
                 self._last_error = str(exc)
                 self._state = "error"
                 self._started_at = None
+            self._notify_status()
         except Exception as exc:  # pragma: no cover - defensive runtime guard
             with self._lock:
                 self._last_error = str(exc)
                 self._state = "error"
                 self._started_at = None
+            self._notify_status()
         finally:
             if temp_path:
                 try:
@@ -428,6 +485,7 @@ class DictationBridgeController:
         with self._lock:
             self._state = "stopped"
             self._started_at = None
+        self._notify_status()
 
     def start_session(self) -> dict[str, Any]:
         with self._lock:
@@ -445,7 +503,9 @@ class DictationBridgeController:
             self._last_error = None
             self._session_thread = threading.Thread(target=self._session_worker, daemon=True)
             self._session_thread.start()
-            return self.get_session_payload()
+            payload = self.get_session_payload()
+        self._notify_status()
+        return payload
 
     def stop_session(self) -> dict[str, Any]:
         with self._lock:
@@ -463,6 +523,7 @@ class DictationBridgeController:
             with self._lock:
                 self._state = "error"
                 self._last_error = "Timed out waiting for session to stop"
+            self._notify_status()
             raise TimeoutError(self._last_error)
         return self.get_session_payload()
 
@@ -480,22 +541,39 @@ class DictationBridgeController:
             self._history.clear()
             self._last_transcript = None
             self._last_completed_at = None
-            return self.get_session_payload()
+            payload = self.get_session_payload()
+        self._notify_status()
+        return payload
+
+    def _health_payload_locked(self) -> dict[str, Any]:
+        return {
+            "schema_version": BRIDGE_SCHEMA_VERSION,
+            "ok": True,
+            "bridge": {
+                "backend": "local-ai-dictation-bridge",
+                "model_backend": self.backend,
+                "model_loaded": self._model_loaded,
+                "model_loading": self._model_loading,
+                "e2e_mode": self._e2e_mode,
+            },
+            "session": self.get_session_payload(),
+        }
 
     def health_payload(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "schema_version": BRIDGE_SCHEMA_VERSION,
-                "ok": True,
-                "bridge": {
-                    "backend": "local-ai-dictation-bridge",
-                    "model_backend": self.backend,
-                    "model_loaded": self._model_loaded,
-                    "model_loading": self._model_loading,
-                    "e2e_mode": self._e2e_mode,
-                },
-                "session": self.get_session_payload(),
-            }
+            return self._health_payload_locked()
+
+    def wait_for_status_update(self, after_version: int | None, *, timeout: float = 15.0) -> tuple[int, dict[str, Any] | None]:
+        with self._lock:
+            if after_version is None:
+                return self._event_version, self._health_payload_locked()
+            updated = self._event_condition.wait_for(
+                lambda: self._event_version != after_version or self._shutdown_requested.is_set(),
+                timeout=timeout,
+            )
+            if not updated or self._shutdown_requested.is_set():
+                return self._event_version, None
+            return self._event_version, self._health_payload_locked()
 
     def get_session_payload(self) -> dict[str, Any]:
         with self._lock:
@@ -534,6 +612,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if parsed.path == "/health":
             self._write_json(200, self.controller.health_payload())
+            return
+        if parsed.path == "/events":
+            self._write_events()
             return
         if parsed.path == "/session":
             self._write_json(200, self.controller.get_session_payload())
@@ -591,6 +672,39 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _write_events(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        version, payload = self.controller.wait_for_status_update(None)
+        if payload is not None:
+            self._write_sse("session", payload)
+
+        while True:
+            version, payload = self.controller.wait_for_status_update(version, timeout=15.0)
+            if payload is None:
+                try:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                continue
+            try:
+                self._write_sse("session", payload)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    def _write_sse(self, event: str, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.wfile.write(f"event: {event}\n".encode("utf-8"))
+        self.wfile.write(b"data: ")
+        self.wfile.write(encoded)
+        self.wfile.write(b"\n\n")
+        self.wfile.flush()
 
 
 def _truthy_query(values: list[str] | None) -> bool:
@@ -658,6 +772,7 @@ def build_bridge_controller_from_namespace(
         e2e_transcript=source_env.get("LOCAL_AI_DICTATION_E2E_TRANSCRIPT", DEFAULT_E2E_TRANSCRIPT),
         e2e_start_delay_ms=_env_int("LOCAL_AI_DICTATION_E2E_START_DELAY_MS", source_env, 0),
         e2e_stop_delay_ms=_env_int("LOCAL_AI_DICTATION_E2E_STOP_DELAY_MS", source_env, 0),
+        status_notifier=_build_status_notifier(source_env),
     )
 
 

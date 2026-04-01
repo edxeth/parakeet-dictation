@@ -232,6 +232,32 @@ def test_bridge_leaves_clipboard_timestamp_unset_when_copy_fails():
 
 
 
+def test_bridge_status_notifier_fires_on_state_changes():
+    notifications: list[str] = []
+    controller = DictationBridgeController(
+        runtime_loader=_runtime_loader,
+        model_loader=_make_model_loader(),
+        recorder=_recorder,
+        transcriber=_transcriber,
+        transcript_timeout=1.0,
+        status_notifier=lambda: notifications.append(controller.get_session_payload()["state"]),
+    )
+
+    started = controller.start_session()
+    assert started["state"] == "starting"
+    time.sleep(0.05)
+    completed = controller.stop_session()
+
+    assert completed["state"] == "idle"
+    assert notifications[0] == "starting"
+    assert "recording" in notifications
+    assert "transcribing" in notifications
+    assert notifications[-1] == "idle"
+
+    controller.shutdown()
+
+
+
 def test_bridge_server_health_and_session_endpoints():
     controller = DictationBridgeController(
         runtime_loader=_runtime_loader,
