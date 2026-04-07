@@ -43,7 +43,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 
 # GPU PyTorch
-uv pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu121
+uv pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu130
 
 # install app
 uv pip install -e .
