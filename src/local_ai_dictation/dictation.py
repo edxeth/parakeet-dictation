@@ -28,6 +28,7 @@ from local_ai_dictation.audio import (
     build_vad_backend,
     downmix_pcm16_to_mono,
     fallback_input_device_id,
+    has_probable_speech,
     list_input_devices,
     pulse_default_source_spec,
     record_until_vad_stop,
@@ -629,6 +630,15 @@ def _transcribe_once(
     *,
     status_stream=None,
 ) -> tuple[TranscriptionResult, str, float, float]:
+    start = time.perf_counter()
+    if not has_probable_speech(audio_data, sample_rate, vad_mode=config.vad_mode):
+        return (
+            TranscriptionResult(text="", metadata={"backend": config.backend, "silence_filtered": True}),
+            "",
+            start,
+            time.perf_counter(),
+        )
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         save_audio(audio_data, tmp.name, sample_rate=sample_rate)
         temp_path = tmp.name
@@ -643,7 +653,6 @@ def _transcribe_once(
     spinner_thread.start()
 
     infer_ctx = nullcontext() if config.debug else _silence_context()
-    start = time.perf_counter()
     try:
         with infer_ctx:
             result = model.transcribe([temp_path], verbose=False)

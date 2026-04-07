@@ -47,6 +47,12 @@ class _FakeModel:
     pass
 
 
+class _GuardModel:
+    def transcribe(self, audio, *, verbose=False):
+        raise AssertionError("model.transcribe should not be called")
+
+
+
 def test_emit_transcription_result_writes_json_stdout_and_output_file(tmp_path):
     output_path = tmp_path / "transcript.json"
     stdout = io.StringIO()
@@ -109,6 +115,23 @@ def test_emit_transcription_result_keeps_clipboard_failure_non_fatal_and_debug_o
     assert debug_warning is not None
     assert debug_stdout.getvalue() == "hello world\n"
     assert "Clipboard warning: CLIPBOARD_UNAVAILABLE" in debug_status.getvalue()
+
+
+def test_transcribe_once_skips_model_inference_for_silence(monkeypatch):
+    monkeypatch.setattr("local_ai_dictation.dictation.has_probable_speech", lambda *args, **kwargs: False)
+
+    transcription, temp_path, start, end = dictation_module._transcribe_once(
+        DictationConfig(clipboard=False),
+        _GuardModel(),
+        b"\x00\x00" * 1024,
+        16000,
+    )
+
+    assert transcription.text == ""
+    assert transcription.metadata == {"backend": "whisper", "silence_filtered": True}
+    assert temp_path == ""
+    assert end >= start
+
 
 
 def test_dictation_json_mode_keeps_status_off_stdout(monkeypatch, capsys):

@@ -18,6 +18,7 @@ DictationConfig = importlib.import_module("local_ai_dictation.types").DictationC
 
 VAD_FRAME_BYTES = audio_module.VAD_FRAME_BYTES
 VAD_FRAME_SAMPLES = audio_module.VAD_FRAME_SAMPLES
+has_probable_speech = audio_module.has_probable_speech
 record_until_vad_stop = audio_module.record_until_vad_stop
 
 
@@ -161,6 +162,20 @@ class _PipeWirePreferredPyAudioModule(_FakePyAudioModule):
 
 SPEECH_FRAME = b"\x01\x00" * (VAD_FRAME_BYTES // 2)
 SILENCE_FRAME = b"\x00\x00" * (VAD_FRAME_BYTES // 2)
+
+
+def test_has_probable_speech_rejects_silence(monkeypatch):
+    monkeypatch.setattr("local_ai_dictation.audio.build_vad_backend", lambda mode: _FakeVadBackend({SPEECH_FRAME}))
+
+    assert has_probable_speech(b"".join([SILENCE_FRAME] * 4), 16000) is False
+
+
+
+def test_has_probable_speech_accepts_multiple_voiced_frames(monkeypatch):
+    monkeypatch.setattr("local_ai_dictation.audio.build_vad_backend", lambda mode: _FakeVadBackend({SPEECH_FRAME}))
+
+    assert has_probable_speech(b"".join([SPEECH_FRAME] * 3), 16000) is True
+
 
 
 def test_vad_auto_stop_only_after_min_speech_and_silence_window():

@@ -254,6 +254,42 @@ def resample_pcm16_mono(
     return converted
 
 
+def has_probable_speech(
+    audio_data: bytes,
+    sample_rate: int,
+    *,
+    vad_mode: int = 2,
+    min_voiced_ms: int = 90,
+) -> bool:
+    if not audio_data:
+        return False
+
+    try:
+        vad = build_vad_backend(vad_mode)
+    except Exception:
+        return True
+
+    prepared_audio = (
+        audio_data
+        if sample_rate == VAD_SAMPLE_RATE
+        else resample_pcm16_mono(audio_data, sample_rate, VAD_SAMPLE_RATE)
+    )
+    voiced_ms = 0
+    required_voiced_ms = max(VAD_FRAME_MS, min_voiced_ms)
+
+    for offset in range(0, len(prepared_audio), VAD_FRAME_BYTES):
+        frame = prepared_audio[offset : offset + VAD_FRAME_BYTES]
+        if not frame:
+            continue
+        if not vad.is_speech(_normalize_vad_frame(frame), VAD_SAMPLE_RATE):
+            continue
+        voiced_ms += VAD_FRAME_MS
+        if voiced_ms >= required_voiced_ms:
+            return True
+
+    return False
+
+
 def record_until_vad_stop(
     stream: Any,
     *,

@@ -48,7 +48,7 @@ class WhisperEngine:
                 str(audio[0]),
                 language="en",
                 condition_on_previous_text=False,
-                vad_filter=False,
+                vad_filter=True,
                 beam_size=5,
             )
             text = "".join(segment.text for segment in segments).strip()
